@@ -32,6 +32,25 @@ NetConfig 深度集成各操作系统的原生底层 API，以保障最高的效
 
 ## 安装与编译
 
+### 一键快速运行
+
+您可以使用以下一行命令，自动检测系统架构并下载最新版本的二进制文件到当前目录：
+
+**Linux**:
+```bash
+curl -sSL https://github.com/shaogme/net-config/releases/latest/download/net-config-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/arm64/arm64/') -o net-config && chmod +x net-config && ./net-config
+```
+
+**macOS**:
+```bash
+curl -sSL https://github.com/shaogme/net-config/releases/latest/download/net-config-macos-$(uname -m | sed 's/x86_64/amd64/;s/arm64/arm64/') -o net-config && chmod +x net-config && ./net-config
+```
+
+**Windows (PowerShell)**:
+```powershell
+$arch = if ($env:PROCESSOR_ARCHITECTURE -match 'ARM|arch64') { 'arm64' } else { 'amd64' }; Invoke-WebRequest -Uri "https://github.com/shaogme/net-config/releases/latest/download/net-config-windows-$arch.exe" -OutFile "net-config.exe"; .\net-config.exe
+```
+
 ### 预编译二进制程序
 
 可以在 GitHub Releases 中直接下载适用于各平台的预编译程序：

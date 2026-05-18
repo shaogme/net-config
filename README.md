@@ -32,6 +32,25 @@ NetConfig relies on native operating system APIs for maximum performance and acc
 
 ## Installation
 
+### Quick Install & Run
+
+You can use the following one-line commands to automatically detect your system architecture, download the latest precompiled binary, and run it instantly:
+
+**Linux**:
+```bash
+curl -sSL https://github.com/shaogme/net-config/releases/latest/download/net-config-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/arm64/arm64/') -o net-config && chmod +x net-config && ./net-config
+```
+
+**macOS**:
+```bash
+curl -sSL https://github.com/shaogme/net-config/releases/latest/download/net-config-macos-$(uname -m | sed 's/x86_64/amd64/;s/arm64/arm64/') -o net-config && chmod +x net-config && ./net-config
+```
+
+**Windows (PowerShell)**:
+```powershell
+$arch = if ($env:PROCESSOR_ARCHITECTURE -match 'ARM|arch64') { 'arm64' } else { 'amd64' }; Invoke-WebRequest -Uri "https://github.com/shaogme/net-config/releases/latest/download/net-config-windows-$arch.exe" -OutFile "net-config.exe"; .\net-config.exe
+```
+
 ### Precompiled Binaries
 
 Precompiled binaries for various platforms are available in the GitHub Releases:
