@@ -1,0 +1,78 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test ${{ matrix.target || matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            name: net-config-linux-amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            name: net-config-linux-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 针对 Linux Musl 编译环境，安装必要的工具以支持链接
+      - name: Install Musl Tools (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # 针对 Unix 交叉编译，安装 cargo-zigbuild 和 zig
+      - name: Install cargo-zigbuild
+        if: matrix.os != 'windows-latest'
+        uses: shaogme/speedy-cargo-zigbuild@main
+
+      - name: Install Zig
+        if: matrix.os != 'windows-latest'
+        uses: https://codeberg.org/mlugg/setup-zig@v2
+
+      # 运行 Windows 测试 (x86_64 可直接原生运行)
+      - name: Run Tests (Windows x64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test --target ${{ matrix.target }}
+
+      # Windows ARM64 交叉编译测试 (只编译测试，不运行)
+      - name: Run Tests (Windows ARM64 - Compile Only)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: cargo test --no-run --target ${{ matrix.target }}
+
+      # Unix 平台可以直接运行的测试 (Linux x86_64, macOS x86_64/aarch64)
+      - name: Run Tests (Unix - Runable Targets)
+        if: matrix.os != 'windows-latest' && matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild test --target ${{ matrix.target }}
+
+      # Linux ARM64 交叉编译测试 (只编译测试，不运行)
+      - name: Run Tests (Unix ARM64 Linux - Compile Only)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild test --no-run --target ${{ matrix.target }}
