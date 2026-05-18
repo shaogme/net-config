@@ -1,17 +1,16 @@
-use std::ptr;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::ptr;
+use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetBestInterface, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
-    GAA_FLAG_INCLUDE_GATEWAYS,
+    GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, GetBestInterface, IP_ADAPTER_ADDRESSES_LH,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    AF_UNSPEC, AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6,
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
 };
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, ERROR_BUFFER_OVERFLOW};
 
 use crate::shared::{
-    NetworkInterfaces, NetworkInterface, Ipv4Info, Ipv6Info,
-    InterfaceStatus, InterfaceType, InterfaceStats,
+    InterfaceStats, InterfaceStatus, InterfaceType, Ipv4Info, Ipv6Info, NetworkInterface,
+    NetworkInterfaces,
 };
 use std::net::IpAddr;
 
@@ -31,7 +30,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     // 1. 获取主网卡接口索引 (GetBestInterface)
     let mut best_index = 0u32;
     // 传入 8.8.8.8 的大端表示 (0x08080808) 探测最优网络接口
-    let has_best_interface = unsafe { GetBestInterface(0x08080808, &mut best_index) } == ERROR_SUCCESS;
+    let has_best_interface =
+        unsafe { GetBestInterface(0x08080808, &mut best_index) } == ERROR_SUCCESS;
 
     // 2. 准备缓冲区以调用 GetAdaptersAddresses
     let mut buf_len = 15000;
@@ -62,7 +62,10 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     }
 
     if res != ERROR_SUCCESS {
-        return Err(format!("GetAdaptersAddresses failed with error code {}", res));
+        return Err(format!(
+            "GetAdaptersAddresses failed with error code {}",
+            res
+        ));
     }
 
     let mut primary: Option<NetworkInterface> = None;
@@ -109,7 +112,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         };
 
         // 判定是否为主网卡
-        let is_primary = has_best_interface && (unsafe { adapter.Anonymous1.Anonymous.IfIndex } == best_index || adapter.Ipv6IfIndex == best_index);
+        let is_primary = has_best_interface
+            && (unsafe { adapter.Anonymous1.Anonymous.IfIndex } == best_index
+                || adapter.Ipv6IfIndex == best_index);
 
         let mut ipv4_addresses = Vec::new();
         let mut ipv6_addresses = Vec::new();
@@ -297,10 +302,13 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     }
 
     // 保底：若无主网卡，选择第一个非环回有IP绑定的网卡作为 primary
-    if primary.is_none() {
-        if let Some(pos) = other.iter().position(|i| !i.description.to_lowercase().contains("loopback") && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())) {
-            primary = Some(other.remove(pos));
-        }
+    if primary.is_none()
+        && let Some(pos) = other.iter().position(|i| {
+            !i.description.to_lowercase().contains("loopback")
+                && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
+        })
+    {
+        primary = Some(other.remove(pos));
     }
 
     Ok(NetworkInterfaces { primary, other })

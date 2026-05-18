@@ -1,12 +1,12 @@
-use std::ptr;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use crate::shared::{
+    InterfaceStats, InterfaceStatus, InterfaceType, Ipv4Info, Ipv6Info, NetworkInterface,
+    NetworkInterfaces,
+};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use crate::shared::{
-    NetworkInterfaces, NetworkInterface, Ipv4Info, Ipv6Info,
-    InterfaceStatus, InterfaceType, InterfaceStats,
-};
 use std::net::IpAddr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::ptr;
 
 struct LinuxRouteV4 {
     iface: String,
@@ -64,8 +64,7 @@ fn parse_hex_to_ipv6(hex_str: &str) -> Result<Ipv6Addr, String> {
     let mut bytes = [0u8; 16];
     for i in 0..16 {
         let byte_str = &hex_str[i * 2..i * 2 + 2];
-        bytes[i] = u8::from_str_radix(byte_str, 16)
-            .map_err(|e| e.to_string())?;
+        bytes[i] = u8::from_str_radix(byte_str, 16).map_err(|e| e.to_string())?;
     }
     Ok(Ipv6Addr::from(bytes))
 }
@@ -85,7 +84,8 @@ fn parse_ipv6_routes() -> Vec<LinuxRouteV6> {
                     let iface = parts[9].to_string();
 
                     if dest_hex.len() == 32 && next_hop_hex.len() == 32 {
-                        let is_default = dest_hex == "00000000000000000000000000000000" && prefix_hex == "00";
+                        let is_default =
+                            dest_hex == "00000000000000000000000000000000" && prefix_hex == "00";
 
                         if let (Ok(gateway), Ok(metric)) = (
                             parse_hex_to_ipv6(next_hop_hex),
@@ -112,12 +112,14 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     let v6_routes = parse_ipv6_routes();
 
     // 找出 Metric 最小且网关有效的默认路由作为主网卡接口
-    let primary_v4_iface = v4_routes.iter()
+    let primary_v4_iface = v4_routes
+        .iter()
         .filter(|r| r.is_default && r.gateway != Ipv4Addr::UNSPECIFIED)
         .min_by_key(|r| r.metric)
         .map(|r| r.iface.clone());
 
-    let primary_v6_iface = v6_routes.iter()
+    let primary_v6_iface = v6_routes
+        .iter()
         .filter(|r| r.is_default && r.gateway != Ipv6Addr::UNSPECIFIED)
         .min_by_key(|r| r.metric)
         .map(|r| r.iface.clone());
@@ -131,7 +133,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         return Err("getifaddrs failed".to_string());
     }
 
-    let mut interface_map: std::collections::HashMap<String, NetworkInterface> = std::collections::HashMap::new();
+    let mut interface_map: std::collections::HashMap<String, NetworkInterface> =
+        std::collections::HashMap::new();
 
     let mut current = ifap;
     while !current.is_null() {
@@ -165,7 +168,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 }
 
                 // 收集绑定在该网卡上的有效网关
-                let gateways = v4_routes.iter()
+                let gateways = v4_routes
+                    .iter()
                     .filter(|r| r.iface == ifa_name && r.gateway != Ipv4Addr::UNSPECIFIED)
                     .map(|r| r.gateway)
                     .collect::<Vec<Ipv4Addr>>();
@@ -178,20 +182,26 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 };
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry = interface_map.entry(ifa_name.clone()).or_insert_with(|| NetworkInterface {
-                    name: ifa_name.clone(),
-                    description: ifa_name.clone(),
-                    mac_address: None,
-                    ipv4_addresses: Vec::new(),
-                    ipv6_addresses: Vec::new(),
-                    status: if is_up { InterfaceStatus::Up } else { InterfaceStatus::Down },
-                    interface_type: InterfaceType::Unknown,
-                    link_speed: None,
-                    dns_servers: Vec::new(),
-                    statistics: None,
-                });
+                let entry =
+                    interface_map
+                        .entry(ifa_name.clone())
+                        .or_insert_with(|| NetworkInterface {
+                            name: ifa_name.clone(),
+                            description: ifa_name.clone(),
+                            mac_address: None,
+                            ipv4_addresses: Vec::new(),
+                            ipv6_addresses: Vec::new(),
+                            status: if is_up {
+                                InterfaceStatus::Up
+                            } else {
+                                InterfaceStatus::Down
+                            },
+                            interface_type: InterfaceType::Unknown,
+                            link_speed: None,
+                            dns_servers: Vec::new(),
+                            statistics: None,
+                        });
                 entry.ipv4_addresses.push(ipv4_info);
-
             } else if sa_family == libc::AF_INET6 {
                 let sock_in6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
                 let ip_bytes = sock_in6.sin6_addr.s6_addr;
@@ -204,7 +214,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     prefix_len = mask_bytes.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
                 }
 
-                let gateways = v6_routes.iter()
+                let gateways = v6_routes
+                    .iter()
                     .filter(|r| r.iface == ifa_name && r.gateway != Ipv6Addr::UNSPECIFIED)
                     .map(|r| r.gateway)
                     .collect::<Vec<Ipv6Addr>>();
@@ -216,18 +227,25 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 };
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry = interface_map.entry(ifa_name.clone()).or_insert_with(|| NetworkInterface {
-                    name: ifa_name.clone(),
-                    description: ifa_name.clone(),
-                    mac_address: None,
-                    ipv4_addresses: Vec::new(),
-                    ipv6_addresses: Vec::new(),
-                    status: if is_up { InterfaceStatus::Up } else { InterfaceStatus::Down },
-                    interface_type: InterfaceType::Unknown,
-                    link_speed: None,
-                    dns_servers: Vec::new(),
-                    statistics: None,
-                });
+                let entry =
+                    interface_map
+                        .entry(ifa_name.clone())
+                        .or_insert_with(|| NetworkInterface {
+                            name: ifa_name.clone(),
+                            description: ifa_name.clone(),
+                            mac_address: None,
+                            ipv4_addresses: Vec::new(),
+                            ipv6_addresses: Vec::new(),
+                            status: if is_up {
+                                InterfaceStatus::Up
+                            } else {
+                                InterfaceStatus::Down
+                            },
+                            interface_type: InterfaceType::Unknown,
+                            link_speed: None,
+                            dns_servers: Vec::new(),
+                            statistics: None,
+                        });
                 entry.ipv6_addresses.push(ipv6_info);
             }
         }
@@ -380,7 +398,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
 
     // 保底：若无主网卡，选择第一个非环回有IP绑定的网卡作为 primary
     if primary.is_none() {
-        if let Some(pos) = other.iter().position(|i| i.name != "lo" && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())) {
+        if let Some(pos) = other.iter().position(|i| {
+            i.name != "lo" && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
+        }) {
             primary = Some(other.remove(pos));
         }
     }

@@ -1,11 +1,11 @@
-use std::ptr;
-use std::net::{Ipv4Addr, Ipv6Addr, IpAddr};
+use crate::shared::{
+    InterfaceStats, InterfaceStatus, InterfaceType, Ipv4Info, Ipv6Info, NetworkInterface,
+    NetworkInterfaces,
+};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use crate::shared::{
-    NetworkInterfaces, NetworkInterface, Ipv4Info, Ipv6Info,
-    InterfaceStatus, InterfaceType, InterfaceStats,
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::ptr;
 
 /// 解析 IPv4 默认路由 (执行 route get default)
 fn get_macos_default_route_v4() -> Option<(String, Ipv4Addr)> {
@@ -86,7 +86,9 @@ fn get_macos_interface_types() -> std::collections::HashMap<String, InterfaceTyp
                     if !device.is_empty() && !current_port.is_empty() {
                         let itype = if current_port.contains("Wi-Fi") {
                             InterfaceType::WiFi
-                        } else if current_port.contains("Ethernet") || current_port.contains("Thunderbolt") {
+                        } else if current_port.contains("Ethernet")
+                            || current_port.contains("Thunderbolt")
+                        {
                             InterfaceType::Ethernet
                         } else if current_port.contains("Bridge") {
                             InterfaceType::Virtual
@@ -141,7 +143,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         return Err("getifaddrs failed".to_string());
     }
 
-    let mut interface_map: std::collections::HashMap<String, NetworkInterface> = std::collections::HashMap::new();
+    let mut interface_map: std::collections::HashMap<String, NetworkInterface> =
+        std::collections::HashMap::new();
 
     let mut current = ifap;
     while !current.is_null() {
@@ -189,20 +192,26 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 };
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry = interface_map.entry(ifa_name.clone()).or_insert_with(|| NetworkInterface {
-                    name: ifa_name.clone(),
-                    description: ifa_name.clone(),
-                    mac_address: None,
-                    ipv4_addresses: Vec::new(),
-                    ipv6_addresses: Vec::new(),
-                    status: if is_up { InterfaceStatus::Up } else { InterfaceStatus::Down },
-                    interface_type: InterfaceType::Unknown,
-                    link_speed: None,
-                    dns_servers: Vec::new(),
-                    statistics: None,
-                });
+                let entry =
+                    interface_map
+                        .entry(ifa_name.clone())
+                        .or_insert_with(|| NetworkInterface {
+                            name: ifa_name.clone(),
+                            description: ifa_name.clone(),
+                            mac_address: None,
+                            ipv4_addresses: Vec::new(),
+                            ipv6_addresses: Vec::new(),
+                            status: if is_up {
+                                InterfaceStatus::Up
+                            } else {
+                                InterfaceStatus::Down
+                            },
+                            interface_type: InterfaceType::Unknown,
+                            link_speed: None,
+                            dns_servers: Vec::new(),
+                            statistics: None,
+                        });
                 entry.ipv4_addresses.push(ipv4_info);
-
             } else if sa_family == libc::AF_INET6 {
                 let sock_in6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
                 let ip_bytes = sock_in6.sin6_addr.s6_addr;
@@ -229,20 +238,26 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 };
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry = interface_map.entry(ifa_name.clone()).or_insert_with(|| NetworkInterface {
-                    name: ifa_name.clone(),
-                    description: ifa_name.clone(),
-                    mac_address: None,
-                    ipv4_addresses: Vec::new(),
-                    ipv6_addresses: Vec::new(),
-                    status: if is_up { InterfaceStatus::Up } else { InterfaceStatus::Down },
-                    interface_type: InterfaceType::Unknown,
-                    link_speed: None,
-                    dns_servers: Vec::new(),
-                    statistics: None,
-                });
+                let entry =
+                    interface_map
+                        .entry(ifa_name.clone())
+                        .or_insert_with(|| NetworkInterface {
+                            name: ifa_name.clone(),
+                            description: ifa_name.clone(),
+                            mac_address: None,
+                            ipv4_addresses: Vec::new(),
+                            ipv6_addresses: Vec::new(),
+                            status: if is_up {
+                                InterfaceStatus::Up
+                            } else {
+                                InterfaceStatus::Down
+                            },
+                            interface_type: InterfaceType::Unknown,
+                            link_speed: None,
+                            dns_servers: Vec::new(),
+                            statistics: None,
+                        });
                 entry.ipv6_addresses.push(ipv6_info);
-
             } else if sa_family == libc::AF_LINK {
                 // macOS 下 AF_LINK 对应数据链路层，用于获取 MAC 地址和流量统计
                 let sdl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
@@ -257,7 +272,12 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     }
                     let formatted = format!(
                         "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                        mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
+                        mac_bytes[0],
+                        mac_bytes[1],
+                        mac_bytes[2],
+                        mac_bytes[3],
+                        mac_bytes[4],
+                        mac_bytes[5]
                     );
                     if formatted != "00:00:00:00:00:00" {
                         mac_address = Some(formatted);
@@ -281,18 +301,25 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 }
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry = interface_map.entry(ifa_name.clone()).or_insert_with(|| NetworkInterface {
-                    name: ifa_name.clone(),
-                    description: ifa_name.clone(),
-                    mac_address: None,
-                    ipv4_addresses: Vec::new(),
-                    ipv6_addresses: Vec::new(),
-                    status: if is_up { InterfaceStatus::Up } else { InterfaceStatus::Down },
-                    interface_type: InterfaceType::Unknown,
-                    link_speed: None,
-                    dns_servers: Vec::new(),
-                    statistics: None,
-                });
+                let entry =
+                    interface_map
+                        .entry(ifa_name.clone())
+                        .or_insert_with(|| NetworkInterface {
+                            name: ifa_name.clone(),
+                            description: ifa_name.clone(),
+                            mac_address: None,
+                            ipv4_addresses: Vec::new(),
+                            ipv6_addresses: Vec::new(),
+                            status: if is_up {
+                                InterfaceStatus::Up
+                            } else {
+                                InterfaceStatus::Down
+                            },
+                            interface_type: InterfaceType::Unknown,
+                            link_speed: None,
+                            dns_servers: Vec::new(),
+                            statistics: None,
+                        });
 
                 if mac_address.is_some() {
                     entry.mac_address = mac_address;
@@ -352,7 +379,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     // 保底：若无主网卡，选择第一个非环回且绑定了IP地址的网卡
     if primary.is_none() {
         if let Some(pos) = other.iter().position(|i| {
-            !i.name.starts_with("lo") && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
+            !i.name.starts_with("lo")
+                && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
         }) {
             primary = Some(other.remove(pos));
         }

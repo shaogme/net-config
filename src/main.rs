@@ -1,10 +1,10 @@
+mod i18n;
 mod os;
 mod shared;
-mod i18n;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    
+
     let mut show_all = false;
     let mut show_help = false;
     let mut json_output = false;
@@ -48,7 +48,10 @@ fn main() {
         if let Some(lang) = i18n::Language::from_str(lang_str) {
             i18n::init(lang);
         } else {
-            eprintln!("Error: Unsupported language '{}'. Supported values: 'zh', 'en'.", lang_str);
+            eprintln!(
+                "Error: Unsupported language '{}'. Supported values: 'zh', 'en'.",
+                lang_str
+            );
             std::process::exit(1);
         }
     }
@@ -119,7 +122,8 @@ fn main() {
 
 fn print_help(program_name: &str) {
     let path = std::path::Path::new(program_name);
-    let name = path.file_name()
+    let name = path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(program_name);
 
@@ -137,12 +141,20 @@ fn print_interface(face: &shared::NetworkInterface) {
     println!("--------------------------------------------------");
     println!(" {}: {}", t!(IfaceName, 14), face.name);
     println!(" {}: {}", t!(IfaceDescription, 14), face.description);
-    
+
     // 1. 状态与指示灯
-    println!(" {}: {}", t!(IfaceStatus, 14), i18n::localize_status(face.status));
+    println!(
+        " {}: {}",
+        t!(IfaceStatus, 14),
+        i18n::localize_status(face.status)
+    );
 
     // 2. 接口类型
-    println!(" {}: {}", t!(IfaceType, 14), i18n::localize_type(face.interface_type));
+    println!(
+        " {}: {}",
+        t!(IfaceType, 14),
+        i18n::localize_type(face.interface_type)
+    );
 
     // 3. 链路速度
     if let Some(speed) = face.link_speed {
@@ -163,9 +175,16 @@ fn print_interface(face: &shared::NetworkInterface) {
         println!(" {}:", t!(Ipv4Config));
         for (i, ipv4) in face.ipv4_addresses.iter().enumerate() {
             println!("   [{}] {}: {}", i + 1, t!(Ipv4AddrLabel, 11), ipv4.address);
-            println!("       {}: {} ({} /{})", t!(Ipv4MaskLabel, 11), ipv4.netmask, t!(Ipv4PrefixSuffix), ipv4.prefix_len);
+            println!(
+                "       {}: {} ({} /{})",
+                t!(Ipv4MaskLabel, 11),
+                ipv4.netmask,
+                t!(Ipv4PrefixSuffix),
+                ipv4.prefix_len
+            );
             let gw_str = if !ipv4.gateways.is_empty() {
-                ipv4.gateways.iter()
+                ipv4.gateways
+                    .iter()
                     .map(|ip| ip.to_string())
                     .collect::<Vec<String>>()
                     .join(", ")
@@ -183,7 +202,8 @@ fn print_interface(face: &shared::NetworkInterface) {
             println!("   [{}] {}: {}", i + 1, t!(Ipv6AddrLabel, 11), ipv6.address);
             println!("       {}: /{}", t!(Ipv6PrefixLabel, 11), ipv6.prefix_len);
             let gw_str = if !ipv6.gateways.is_empty() {
-                ipv6.gateways.iter()
+                ipv6.gateways
+                    .iter()
                     .map(|ip| ip.to_string())
                     .collect::<Vec<String>>()
                     .join(", ")
@@ -200,7 +220,11 @@ fn print_interface(face: &shared::NetworkInterface) {
         let len = face.dns_servers.len();
         for (i, dns) in face.dns_servers.iter().enumerate() {
             let is_last = i == len - 1;
-            let prefix = if is_last { "   └──" } else { "   ├──" };
+            let prefix = if is_last {
+                "   └──"
+            } else {
+                "   ├──"
+            };
             println!("{} {}", prefix, dns);
         }
     }
@@ -208,8 +232,20 @@ fn print_interface(face: &shared::NetworkInterface) {
     // 8. 网络吞吐流量统计 (采用树状结构)
     if let Some(ref stats) = face.statistics {
         println!(" {}:", t!(Statistics));
-        println!("   ├── {}: {} ({} {})", t!(RxStats, 16), format_bytes(stats.rx_bytes), stats.rx_packets, t!(Packets));
-        println!("   └── {}: {} ({} {})", t!(TxStats, 16), format_bytes(stats.tx_bytes), stats.tx_packets, t!(Packets));
+        println!(
+            "   ├── {}: {} ({} {})",
+            t!(RxStats, 16),
+            format_bytes(stats.rx_bytes),
+            stats.rx_packets,
+            t!(Packets)
+        );
+        println!(
+            "   └── {}: {} ({} {})",
+            t!(TxStats, 16),
+            format_bytes(stats.tx_bytes),
+            stats.tx_packets,
+            t!(Packets)
+        );
     }
 }
 

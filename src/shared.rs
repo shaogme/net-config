@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use serde::{Serialize, Deserialize};
 
 /// 物理/虚拟接口运行状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,20 +109,24 @@ mod tests {
     fn test_get_network_interfaces() {
         let res = get_network_interfaces();
         assert!(res.is_ok(), "获取网卡信息失败: {:?}", res.err());
-        
+
         let interfaces = res.unwrap();
-        
+
         // 验证主网卡（如果存在）的字段完整性
         if let Some(ref primary) = interfaces.primary {
             assert!(!primary.name.is_empty(), "主网卡名称不能为空");
             assert!(!primary.description.is_empty(), "主网卡描述不能为空");
-            
+
             // 验证 MAC 地址格式（如果存在）
             if let Some(ref mac) = primary.mac_address {
-                assert!(mac.contains(':') || mac.is_empty(), "MAC 地址格式可能不正确: {}", mac);
+                assert!(
+                    mac.contains(':') || mac.is_empty(),
+                    "MAC 地址格式可能不正确: {}",
+                    mac
+                );
             }
         }
-        
+
         // 验证其他网卡的字段完整性
         for iface in &interfaces.other {
             assert!(!iface.name.is_empty(), "网卡名称不能为空");
@@ -139,4 +143,3 @@ mod tests {
         }
     }
 }
-

@@ -66,7 +66,7 @@ pub enum Text {
     SpeedUnknown,
     MacUnknown,
     Packets,
-    
+
     // 排版对齐专用标签
     Ipv4AddrLabel,
     Ipv4MaskLabel,
@@ -114,7 +114,7 @@ impl Text {
                 Text::SpeedUnknown => "未知或未连接",
                 Text::MacUnknown => "未知",
                 Text::Packets => "数据包",
-                
+
                 // 排版对齐专用标签
                 Text::Ipv4AddrLabel => "地址",
                 Text::Ipv4MaskLabel => "子网掩码",
@@ -132,16 +132,24 @@ impl Text {
                 Text::JsonError => "Error: Failed to serialize JSON",
                 Text::FetchInterfaceError => "Error: Failed to get network interfaces",
                 Text::PrimaryInterfaceHeader => "Primary Interface",
-                Text::NoPrimaryInterface => "  (No primary interface detected, possibly no internet connection)",
+                Text::NoPrimaryInterface => {
+                    "  (No primary interface detected, possibly no internet connection)"
+                }
                 Text::OtherInterfaceHeader => "Other Interfaces",
                 Text::NoOtherInterface => "  (No other interfaces)",
                 Text::Usage => "Usage:",
-                Text::UsageTitle => "NetConfig - A cross-platform network interface topology analysis tool\n",
+                Text::UsageTitle => {
+                    "NetConfig - A cross-platform network interface topology analysis tool\n"
+                }
                 Text::OptionsHeader => "Options:",
-                Text::OptAll => "  -a, --all      Show all network interfaces (default shows primary/default interface only)",
+                Text::OptAll => {
+                    "  -a, --all      Show all network interfaces (default shows primary/default interface only)"
+                }
                 Text::OptJson => "  -j, --json     Output results in JSON format",
                 Text::OptHelp => "  -h, --help     Show help information",
-                Text::OptLang => "  -l, --lang     Specify language, 'zh' (Chinese) or 'en' (English)",
+                Text::OptLang => {
+                    "  -l, --lang     Specify language, 'zh' (Chinese) or 'en' (English)"
+                }
                 Text::IfaceName => "Interface Name",
                 Text::IfaceDescription => "Description",
                 Text::IfaceStatus => "Status",
@@ -157,7 +165,7 @@ impl Text {
                 Text::SpeedUnknown => "Unknown or disconnected",
                 Text::MacUnknown => "Unknown",
                 Text::Packets => "packets",
-                
+
                 // 排版对齐专用标签
                 Text::Ipv4AddrLabel => "Address",
                 Text::Ipv4MaskLabel => "Subnet Mask",
@@ -168,7 +176,7 @@ impl Text {
                 Text::Ipv6GatewayLabel => "Gateway",
                 Text::Ipv6GatewayNone => "None",
                 Text::Ipv4PrefixSuffix => "Prefix",
-            }
+            },
         }
     }
 }
@@ -189,12 +197,14 @@ fn is_full_width(c: char) -> bool {
     (0xAC00..=0xD7A3).contains(&cp) || // 谚文音节 (韩文)
     (0xF900..=0xFAFF).contains(&cp) || // CJK 兼容表意文字
     (0xFE30..=0xFE4F).contains(&cp) || // CJK 兼容形式
-    (0x20000..=0x3FFFD).contains(&cp)  // CJK 扩展 B-G
+    (0x20000..=0x3FFFD).contains(&cp) // CJK 扩展 B-G
 }
 
 /// 计算字符串在终端中的真实显示列宽
 pub fn display_width(s: &str) -> usize {
-    s.chars().map(|c| if is_full_width(c) { 2 } else { 1 }).sum()
+    s.chars()
+        .map(|c| if is_full_width(c) { 2 } else { 1 })
+        .sum()
 }
 
 /// 将字符串向右填充空格到指定的终端列宽
@@ -233,7 +243,7 @@ pub fn localize_status(status: crate::shared::InterfaceStatus) -> &'static str {
             crate::shared::InterfaceStatus::Down => "🔴 Down",
             crate::shared::InterfaceStatus::Testing => "🟡 Testing",
             crate::shared::InterfaceStatus::Unknown => "⚪ Unknown",
-        }
+        },
     }
 }
 
@@ -257,6 +267,6 @@ pub fn localize_type(itype: crate::shared::InterfaceType) -> &'static str {
             crate::shared::InterfaceType::Tunnel => "Tunnel / VPN",
             crate::shared::InterfaceType::Other => "Other",
             crate::shared::InterfaceType::Unknown => "Unknown",
-        }
+        },
     }
 }
