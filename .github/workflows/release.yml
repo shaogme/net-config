@@ -48,7 +48,7 @@ jobs:
         uses: shaogme/speedy-cargo-zigbuild@main
 
       - name: Install Zig
-        uses: https://codeberg.org/mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@main
 
       - name: Build with cargo (Windows)
         if: matrix.os == 'windows-latest'
