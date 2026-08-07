@@ -9,12 +9,13 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
 ## Features
 
 - Primary Interface Auto-Detection: Automatically resolves the active gateway and primary network interface based on OS routing metrics and system APIs.
+- Protocol Stack Allocation Detection: Automatically detects and identifies whether network interfaces and their IP bindings use Dynamic allocation (DHCP / SLAAC) or Static manual configuration.
 - Comprehensive Interface Data:
   - Network state: Up, Down, Testing, or Unknown.
   - Physical medium: Ethernet, Wi-Fi, Loopback, Virtual/Bridge, Tunnel/VPN, and others.
   - Hardware addresses: MAC address detection and formatting.
   - Performance data: Active link speed (Gbps, Mbps, Kbps) and real-time traffic statistics (both received and transmitted bytes/packets).
-- Deep IP Topology: Fully parses multiple IPv4 and IPv6 bindings, subnet masks, prefix lengths, and corresponding gateway paths.
+- Deep IP Topology: Fully parses multiple IPv4 and IPv6 bindings, subnet masks, prefix lengths, gateway paths, and allocation methods (Dynamic / Static).
 - System DNS Diagnostics: Resolves and associates active system DNS servers.
 - Flexible Outputs:
   - Polished terminal layout with clean tree-like text alignments.
@@ -26,9 +27,9 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
 
 NetConfig relies on native operating system APIs for maximum performance and accuracy:
 
-- Windows: Uses the IP Helper (IPHLPAPI) library. Resolves the primary interface via GetBestInterface using a mock target IP address. Extracts adapters, unicast IPs, prefixes, gateways, and DNS servers using GetAdaptersAddresses. Queries traffic throughput statistics and hardware speeds using GetIfEntry2.
-- Linux: Parses /proc/net/route and /proc/net/ipv6_route to evaluate routing metrics and find the primary gateway. Queries system interfaces and IP details using libc::getifaddrs. Retrieves interface operational state, media type, link speed, MAC address, and traffic counters directly from /sys/class/net/<interface>/. Parses /etc/resolv.conf for DNS.
-- macOS: Detects the active interface by running route get default and route get -inet6 default and parsing the gateway. Uses networksetup -listallhardwareports to distinguish physical media. Uses libc::getifaddrs to list IP bindings, and parses AF_LINK for MAC addresses and hardware metrics. Parses /etc/resolv.conf for DNS.
+- Windows: Uses the IP Helper (IPHLPAPI) library. Resolves the primary interface via GetBestInterface using a mock target IP address. Extracts adapters, unicast IPs, prefixes, PrefixOrigin (for DHCP/Static detection), gateways, and DNS servers using GetAdaptersAddresses. Queries traffic throughput statistics and hardware speeds using GetIfEntry2.
+- Linux: Parses /proc/net/route and /proc/net/ipv6_route to evaluate routing metrics and find the primary gateway. Queries system interfaces and IP details using libc::getifaddrs. Evaluates IPv6 IFA_F_PERMANENT flags in /proc/net/if_inet6, lease files (systemd-networkd, NetworkManager, dhclient), and active DHCP process lists to determine dynamic vs static allocations. Retrieves interface operational state, media type, link speed, MAC address, and traffic counters directly from /sys/class/net/<interface>/. Parses /etc/resolv.conf for DNS.
+- macOS: Detects the active interface by running route get default and route get -inet6 default and parsing the gateway. Uses networksetup -listallhardwareports to distinguish physical media. Runs ipconfig getpacket to detect DHCP packet headers and IP allocation mode. Uses libc::getifaddrs to list IP bindings, and parses AF_LINK for MAC addresses and hardware metrics. Parses /etc/resolv.conf for DNS.
 
 ## Installation
 
@@ -104,16 +105,19 @@ Below is an example of the text representation in English:
  Description   : en0
  Status        : Up
  Type          : Wi-Fi
+ Allocation    : Dynamic (DHCP)
  Link Speed    : 1.20 Gbps
  MAC Address   : 00:00:5E:00:53:01
  IPv4 Config   :
    [1] Address    : 192.168.1.100
        Subnet Mask: 255.255.255.0 (Prefix /24)
        Gateway    : 192.168.1.1
+       Allocation : Dynamic (DHCP)
  IPv6 Config   :
    [1] Address    : fe80::1000:2000:3000:4000
        Prefix Len : /64
        Gateway    : fe80::1
+       Allocation : Dynamic (DHCP)
  DNS Servers   :
    ├── 1.1.1.1
    └── 8.8.8.8
@@ -139,7 +143,8 @@ Below is an example of the text representation in English:
         "prefix_len": 24,
         "gateways": [
           "192.168.1.1"
-        ]
+        ],
+        "allocation": "Dynamic"
       }
     ],
     "ipv6_addresses": [
@@ -148,11 +153,13 @@ Below is an example of the text representation in English:
         "prefix_len": 64,
         "gateways": [
           "fe80::1"
-        ]
+        ],
+        "allocation": "Dynamic"
       }
     ],
     "status": "Up",
     "interface_type": "WiFi",
+    "allocation": "Dynamic",
     "link_speed": 1200000000,
     "dns_servers": [
       "1.1.1.1",

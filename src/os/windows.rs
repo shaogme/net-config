@@ -9,8 +9,8 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use crate::shared::{
-    InterfaceStats, InterfaceStatus, InterfaceType, Ipv4Info, Ipv6Info, NetworkInterface,
-    NetworkInterfaces,
+    InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info, Ipv6Info,
+    NetworkInterface, NetworkInterfaces,
 };
 use std::net::IpAddr;
 
@@ -127,6 +127,20 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
 
             if !lp_sockaddr.is_null() {
                 let sa_family = unsafe { (*lp_sockaddr).sa_family };
+                let prefix_origin = unicast.PrefixOrigin;
+                let is_dhcp_adapter = (unsafe { adapter.Anonymous2.Flags } & 0x0004) != 0;
+
+                let alloc = match prefix_origin {
+                    1 => IpAllocation::Static,
+                    3 | 4 => IpAllocation::Dynamic,
+                    _ => {
+                        if is_dhcp_adapter {
+                            IpAllocation::Dynamic
+                        } else {
+                            IpAllocation::Static
+                        }
+                    }
+                };
 
                 if sa_family as u32 == AF_INET as u32 {
                     let sock_in = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN) };
@@ -143,6 +157,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                         netmask,
                         prefix_len,
                         gateways: Vec::new(),
+                        allocation: alloc,
                     });
                 } else if sa_family as u32 == AF_INET6 as u32 {
                     let sock_in6 = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN6) };
@@ -155,6 +170,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                         address: ip,
                         prefix_len,
                         gateways: Vec::new(),
+                        allocation: alloc,
                     });
                 }
             }
@@ -279,6 +295,21 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
             None
         };
 
+        let is_dhcp_enabled = (unsafe { adapter.Anonymous2.Flags } & 0x0004) != 0;
+        let has_dynamic_ip = ipv4_addresses
+            .iter()
+            .any(|i| i.allocation == IpAllocation::Dynamic)
+            || ipv6_addresses
+                .iter()
+                .any(|i| i.allocation == IpAllocation::Dynamic);
+        let allocation = if is_dhcp_enabled || has_dynamic_ip {
+            IpAllocation::Dynamic
+        } else if !ipv4_addresses.is_empty() || !ipv6_addresses.is_empty() {
+            IpAllocation::Static
+        } else {
+            IpAllocation::Unknown
+        };
+
         let iface = NetworkInterface {
             name,
             description,
@@ -287,6 +318,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
             ipv6_addresses,
             status,
             interface_type,
+            allocation,
             link_speed,
             dns_servers,
             statistics,

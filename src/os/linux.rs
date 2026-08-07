@@ -1,6 +1,6 @@
 use crate::shared::{
-    InterfaceStats, InterfaceStatus, InterfaceType, Ipv4Info, Ipv6Info, NetworkInterface,
-    NetworkInterfaces,
+    InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info, Ipv6Info,
+    NetworkInterface, NetworkInterfaces,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -106,10 +106,77 @@ fn parse_ipv6_routes() -> Vec<LinuxRouteV6> {
     routes
 }
 
+fn is_dhcp_interface_linux(iface: &str) -> bool {
+    if iface == "lo" {
+        return false;
+    }
+    if std::path::Path::new("/run/systemd/netif/leases").exists() {
+        if let Ok(entries) = std::fs::read_dir("/run/systemd/netif/leases") {
+            for entry in entries.flatten() {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    if content.contains(&format!("INTERFACE={}", iface)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    let nm_paths = [
+        format!("/var/lib/NetworkManager/dhclient-{}.lease", iface),
+        format!("/var/lib/NetworkManager/dhclient6-{}.lease", iface),
+        format!("/var/lib/dhcp/dhclient-{}.leases", iface),
+        format!("/var/lib/dhcpcd/{}.lease", iface),
+    ];
+    for path in &nm_paths {
+        if std::path::Path::new(path).exists() {
+            return true;
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let pid_path = entry.path().join("cmdline");
+            if pid_path.exists() {
+                if let Ok(cmdline) = std::fs::read_to_string(pid_path) {
+                    if (cmdline.contains("dhclient")
+                        || cmdline.contains("dhcpcd")
+                        || cmdline.contains("udhcpc"))
+                        && cmdline.contains(iface)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn parse_ipv6_permanent_map() -> std::collections::HashMap<(String, Ipv6Addr), bool> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(file) = File::open("/proc/net/if_inet6") {
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                if let (Ok(ip), Ok(flags)) = (
+                    parse_hex_to_ipv6(parts[0]),
+                    u32::from_str_radix(parts[4], 16),
+                ) {
+                    let iface = parts[5].to_string();
+                    let is_permanent = (flags & 0x80) != 0;
+                    map.insert((iface, ip), is_permanent);
+                }
+            }
+        }
+    }
+    map
+}
+
 pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     // 1. 获取默认路由及网关列表
     let v4_routes = parse_ipv4_routes();
     let v6_routes = parse_ipv6_routes();
+    let v6_perm_map = parse_ipv6_permanent_map();
 
     // 找出 Metric 最小且网关有效的默认路由作为主网卡接口
     let primary_v4_iface = v4_routes
@@ -174,11 +241,21 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     .map(|r| r.gateway)
                     .collect::<Vec<Ipv4Addr>>();
 
+                let is_dhcp = is_dhcp_interface_linux(&ifa_name);
+                let alloc = if ifa_name == "lo" {
+                    IpAllocation::Static
+                } else if is_dhcp {
+                    IpAllocation::Dynamic
+                } else {
+                    IpAllocation::Static
+                };
+
                 let ipv4_info = Ipv4Info {
                     address: ip,
                     netmask,
                     prefix_len,
                     gateways,
+                    allocation: alloc,
                 };
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
@@ -197,6 +274,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                                 InterfaceStatus::Down
                             },
                             interface_type: InterfaceType::Unknown,
+                            allocation: IpAllocation::Unknown,
                             link_speed: None,
                             dns_servers: Vec::new(),
                             statistics: None,
@@ -220,10 +298,26 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     .map(|r| r.gateway)
                     .collect::<Vec<Ipv6Addr>>();
 
+                let is_dhcp = is_dhcp_interface_linux(&ifa_name);
+                let alloc = if ifa_name == "lo" {
+                    IpAllocation::Static
+                } else if let Some(&is_perm) = v6_perm_map.get(&(ifa_name.clone(), ip)) {
+                    if is_perm {
+                        IpAllocation::Static
+                    } else {
+                        IpAllocation::Dynamic
+                    }
+                } else if is_dhcp {
+                    IpAllocation::Dynamic
+                } else {
+                    IpAllocation::Static
+                };
+
                 let ipv6_info = Ipv6Info {
                     address: ip,
                     prefix_len,
                     gateways,
+                    allocation: alloc,
                 };
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
@@ -242,6 +336,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                                 InterfaceStatus::Down
                             },
                             interface_type: InterfaceType::Unknown,
+                            allocation: IpAllocation::Unknown,
                             link_speed: None,
                             dns_servers: Vec::new(),
                             statistics: None,
@@ -382,6 +477,26 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 tx_packets,
             });
         }
+
+        // 6. 确定网卡协议栈/IP 分配方式
+        let is_dhcp = is_dhcp_interface_linux(name);
+        let has_dynamic = interface
+            .ipv4_addresses
+            .iter()
+            .any(|a| a.allocation == IpAllocation::Dynamic)
+            || interface
+                .ipv6_addresses
+                .iter()
+                .any(|a| a.allocation == IpAllocation::Dynamic);
+        interface.allocation = if name == "lo" {
+            IpAllocation::Static
+        } else if is_dhcp || has_dynamic {
+            IpAllocation::Dynamic
+        } else if !interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty() {
+            IpAllocation::Static
+        } else {
+            IpAllocation::Unknown
+        };
     }
 
     let mut primary: Option<NetworkInterface> = None;
@@ -405,7 +520,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         }
     }
 
-    // 6. 解析并分配全局 DNS 给主网卡
+    // 7. 解析并分配全局 DNS 给主网卡
     fn parse_dns_servers() -> Vec<IpAddr> {
         let mut dns = Vec::new();
         if let Ok(file) = File::open("/etc/resolv.conf") {

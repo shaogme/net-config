@@ -24,6 +24,18 @@ pub enum InterfaceType {
     Unknown,
 }
 
+/// IP 地址/协议栈配置分配方式（静态/动态）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub enum IpAllocation {
+    /// 动态分配 (DHCP / SLAAC)
+    Dynamic,
+    /// 静态分配 (手动指定)
+    Static,
+    /// 未知
+    Unknown,
+}
+
 /// 流量数据吞吐统计
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct InterfaceStats {
@@ -59,6 +71,8 @@ pub struct NetworkInterface {
     pub status: InterfaceStatus,
     /// 接口类型
     pub interface_type: InterfaceType,
+    /// 协议栈/IP 地址分配模式（静态/动态/未知）
+    pub allocation: IpAllocation,
     /// 链路速度（单位：bps，例如 1000000000 表示 1 Gbps，None 表示未知或不可用）
     pub link_speed: Option<u64>,
     /// DNS 服务器列表
@@ -78,6 +92,8 @@ pub struct Ipv4Info {
     pub prefix_len: u8,
     /// 该网卡关联的网关列表
     pub gateways: Vec<Ipv4Addr>,
+    /// IP 分配方式（动态/静态/未知）
+    pub allocation: IpAllocation,
 }
 
 /// IPv6 地址与相关路由信息
@@ -89,6 +105,8 @@ pub struct Ipv6Info {
     pub prefix_len: u8,
     /// 该网卡关联的网关列表
     pub gateways: Vec<Ipv6Addr>,
+    /// IP 分配方式（动态/静态/未知）
+    pub allocation: IpAllocation,
 }
 
 /// 跨平台获取所有网卡信息的统一 API

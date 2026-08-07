@@ -156,21 +156,28 @@ fn print_interface(face: &shared::NetworkInterface) {
         i18n::localize_type(face.interface_type)
     );
 
-    // 3. 链路速度
+    // 3. IP/协议栈分配方式
+    println!(
+        " {}: {}",
+        t!(IfaceAllocation, 14),
+        i18n::localize_allocation(face.allocation)
+    );
+
+    // 4. 链路速度
     if let Some(speed) = face.link_speed {
         println!(" {}: {}", t!(IfaceSpeed, 14), format_link_speed(speed));
     } else {
         println!(" {}: {}", t!(IfaceSpeed, 14), t!(SpeedUnknown));
     }
 
-    // 4. MAC 地址
+    // 5. MAC 地址
     if let Some(ref mac) = face.mac_address {
         println!(" {}: {}", t!(IfaceMac, 14), mac);
     } else {
         println!(" {}: {}", t!(IfaceMac, 14), t!(MacUnknown));
     }
 
-    // 5. IPv4 地址配置
+    // 6. IPv4 地址配置
     if !face.ipv4_addresses.is_empty() {
         println!(" {}:", t!(Ipv4Config));
         for (i, ipv4) in face.ipv4_addresses.iter().enumerate() {
@@ -192,10 +199,15 @@ fn print_interface(face: &shared::NetworkInterface) {
                 t!(Ipv4GatewayNone).to_string()
             };
             println!("       {}: {}", t!(Ipv4GatewayLabel, 11), gw_str);
+            println!(
+                "       {}: {}",
+                t!(Ipv4AllocLabel, 11),
+                i18n::localize_allocation(ipv4.allocation)
+            );
         }
     }
 
-    // 6. IPv6 地址配置
+    // 7. IPv6 地址配置
     if !face.ipv6_addresses.is_empty() {
         println!(" {}:", t!(Ipv6Config));
         for (i, ipv6) in face.ipv6_addresses.iter().enumerate() {
@@ -211,10 +223,15 @@ fn print_interface(face: &shared::NetworkInterface) {
                 t!(Ipv6GatewayNone).to_string()
             };
             println!("       {}: {}", t!(Ipv6GatewayLabel, 11), gw_str);
+            println!(
+                "       {}: {}",
+                t!(Ipv6AllocLabel, 11),
+                i18n::localize_allocation(ipv6.allocation)
+            );
         }
     }
 
-    // 7. DNS 服务器配置 (采用树状结构)
+    // 8. DNS 服务器配置 (采用树状结构)
     if !face.dns_servers.is_empty() {
         println!(" {}:", t!(DnsServers));
         let len = face.dns_servers.len();
@@ -229,7 +246,7 @@ fn print_interface(face: &shared::NetworkInterface) {
         }
     }
 
-    // 8. 网络吞吐流量统计 (采用树状结构)
+    // 9. 网络吞吐流量统计 (采用树状结构)
     if let Some(ref stats) = face.statistics {
         println!(" {}:", t!(Statistics));
         println!(

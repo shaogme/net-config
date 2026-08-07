@@ -55,6 +55,7 @@ pub enum Text {
     IfaceDescription,
     IfaceStatus,
     IfaceType,
+    IfaceAllocation,
     IfaceSpeed,
     IfaceMac,
     Ipv4Config,
@@ -72,10 +73,12 @@ pub enum Text {
     Ipv4MaskLabel,
     Ipv4GatewayLabel,
     Ipv4GatewayNone,
+    Ipv4AllocLabel,
     Ipv6AddrLabel,
     Ipv6PrefixLabel,
     Ipv6GatewayLabel,
     Ipv6GatewayNone,
+    Ipv6AllocLabel,
     Ipv4PrefixSuffix,
 }
 
@@ -103,6 +106,7 @@ impl Text {
                 Text::IfaceDescription => "友好描述",
                 Text::IfaceStatus => "接口状态",
                 Text::IfaceType => "接口类型",
+                Text::IfaceAllocation => "IP 分配",
                 Text::IfaceSpeed => "链路速度",
                 Text::IfaceMac => "MAC 地址",
                 Text::Ipv4Config => "IPv4 配置",
@@ -120,10 +124,12 @@ impl Text {
                 Text::Ipv4MaskLabel => "子网掩码",
                 Text::Ipv4GatewayLabel => "默认网关",
                 Text::Ipv4GatewayNone => "无",
+                Text::Ipv4AllocLabel => "分配方式",
                 Text::Ipv6AddrLabel => "地址",
                 Text::Ipv6PrefixLabel => "前缀长度",
                 Text::Ipv6GatewayLabel => "默认网关",
                 Text::Ipv6GatewayNone => "无",
+                Text::Ipv6AllocLabel => "分配方式",
                 Text::Ipv4PrefixSuffix => "前缀",
             },
             Language::En => match self {
@@ -154,6 +160,7 @@ impl Text {
                 Text::IfaceDescription => "Description",
                 Text::IfaceStatus => "Status",
                 Text::IfaceType => "Type",
+                Text::IfaceAllocation => "Allocation",
                 Text::IfaceSpeed => "Link Speed",
                 Text::IfaceMac => "MAC Address",
                 Text::Ipv4Config => "IPv4 Config",
@@ -171,10 +178,12 @@ impl Text {
                 Text::Ipv4MaskLabel => "Subnet Mask",
                 Text::Ipv4GatewayLabel => "Gateway",
                 Text::Ipv4GatewayNone => "None",
+                Text::Ipv4AllocLabel => "Allocation",
                 Text::Ipv6AddrLabel => "Address",
                 Text::Ipv6PrefixLabel => "Prefix Len",
                 Text::Ipv6GatewayLabel => "Gateway",
                 Text::Ipv6GatewayNone => "None",
+                Text::Ipv6AllocLabel => "Allocation",
                 Text::Ipv4PrefixSuffix => "Prefix",
             },
         }
@@ -267,6 +276,22 @@ pub fn localize_type(itype: crate::shared::InterfaceType) -> &'static str {
             crate::shared::InterfaceType::Tunnel => "Tunnel / VPN",
             crate::shared::InterfaceType::Other => "Other",
             crate::shared::InterfaceType::Unknown => "Unknown",
+        },
+    }
+}
+
+/// IP 分配方式的本地化封装
+pub fn localize_allocation(alloc: crate::shared::IpAllocation) -> &'static str {
+    match current() {
+        Language::Zh => match alloc {
+            crate::shared::IpAllocation::Dynamic => "动态分配 (DHCP)",
+            crate::shared::IpAllocation::Static => "静态分配 (Static)",
+            crate::shared::IpAllocation::Unknown => "未知 (Unknown)",
+        },
+        Language::En => match alloc {
+            crate::shared::IpAllocation::Dynamic => "Dynamic (DHCP)",
+            crate::shared::IpAllocation::Static => "Static",
+            crate::shared::IpAllocation::Unknown => "Unknown",
         },
     }
 }

@@ -9,12 +9,13 @@ NetConfig 是一个用 Rust 编写的轻量级、高性能、跨平台网络接�
 ## 功能特性
 
 - 智能主网卡识别：自动检测活动网关，并根据操作系统路由指标与 API 解析出最优的默认主网卡接口。
+- 协议栈分配模式检测：自动诊断并标识网卡及其绑定的 IP 地址是动态分配 (DHCP / SLAAC) 还是静态手动配置 (Static)。
 - 完整的网络接口信息：
   - 运行状态：已启用 (Up)、未启用 (Down)、测试中 (Testing) 或未知 (Unknown)。
   - 物理介质/接口类型：以太网、无线局域网 (Wi-Fi)、本地环回、虚拟网卡/网桥、隧道/VPN 以及其他类型。
   - 物理地址：MAC 地址的自动检测与格式化。
   - 速率与吞吐量：链路速度自动换算（Gbps、Mbps、Kbps）及实时的网络流量统计（接收和发送的字节数与数据包数）。
-- 深入的 IP 拓扑解析：完整解析单个网卡上绑定的多个 IPv4 和 IPv6 地址配置，包括子网掩码、前缀长度和网关路径。
+- 深入的 IP 拓扑解析：完整解析单个网卡上绑定的多个 IPv4 和 IPv6 地址配置，包括子网掩码、前缀长度、网关路径及分配方式（动态/静态）。
 - 系统 DNS 诊断：自动提取系统当前处于活动状态的 DNS 服务器列表并进行关联展示。
 - 灵活的输出格式：
   - 精美格式化的终端树状文本对齐排版。
@@ -26,9 +27,9 @@ NetConfig 是一个用 Rust 编写的轻量级、高性能、跨平台网络接�
 
 NetConfig 深度集成各操作系统的原生底层 API，以保障最高的效率与准确性：
 
-- Windows：调用 IP 助手 (IP Helper / IPHLPAPI) API。通过 GetBestInterface 传入模拟外部 IP 以确定当前主网卡索引；使用 GetAdaptersAddresses 接口一次性提取网络适配器、单播 IP 列表、前缀长度、网关和 DNS 服务器信息；通过 GetIfEntry2 获取物理网速和流量吞吐统计。
-- Linux：解析 /proc/net/route 和 /proc/net/ipv6_route 路由文件，分析 Metric 路由权重以找出默认网关及对应的主网卡。使用 libc::getifaddrs 遍历 IP 地址和掩码列表。从 /sys/class/net/<interface>/ 目录下的虚拟文件中读取网卡状态、物理类型、链路速度、MAC 地址和流量统计。解析 /etc/resolv.conf 文件获取系统 DNS。
-- macOS：通过运行 route get default 与 route get -inet6 default 命令并解析输出，智能确定主网卡名称及其网关。使用 networksetup -listallhardwareports 区分物理端口介质。通过 libc::getifaddrs 提取 IP 信息，从 AF_LINK 套接字结构中提取 MAC 地址、物理速度和网络吞吐。解析 /etc/resolv.conf 文件获取系统 DNS。
+- Windows：调用 IP 助手 (IP Helper / IPHLPAPI) API。通过 GetBestInterface 传入模拟外部 IP 以确定当前主网卡索引；使用 GetAdaptersAddresses 接口一次性提取网络适配器、单播 IP 列表、前缀长度、PrefixOrigin（判断 DHCP / 静态分配）、网关和 DNS 服务器信息；通过 GetIfEntry2 获取物理网速和流量吞吐统计。
+- Linux：解析 /proc/net/route 和 /proc/net/ipv6_route 路由文件，分析 Metric 路由权重以找出默认网关及对应的主网卡。使用 libc::getifaddrs 遍历 IP 地址和掩码列表。从 /proc/net/if_inet6 的 IFA_F_PERMANENT 标志、systemd-networkd / NetworkManager 租约文件和进程列表中提取动态/静态分配模式。从 /sys/class/net/<interface>/ 目录下的虚拟文件中读取网卡状态、物理类型、链路速度、MAC 地址和流量统计。解析 /etc/resolv.conf 文件获取系统 DNS。
+- macOS：通过运行 route get default 与 route get -inet6 default 命令并解析输出，智能确定主网卡名称及其网关。使用 networksetup -listallhardwareports 区分物理端口介质。运行 ipconfig getpacket 检测 DHCP 报文与 IP 分配模式。通过 libc::getifaddrs 提取 IP 信息，从 AF_LINK 套接字结构中提取 MAC 地址、物理速度和网络吞吐。解析 /etc/resolv.conf 文件获取系统 DNS。
 
 ## 安装与编译
 
@@ -104,16 +105,19 @@ cargo build --release
  Description   : en0
  Status        : Up
  Type          : Wi-Fi
+ Allocation    : Dynamic (DHCP)
  Link Speed    : 1.20 Gbps
  MAC Address   : 00:00:5E:00:53:01
  IPv4 Config   :
    [1] Address    : 192.168.1.100
        Subnet Mask: 255.255.255.0 (Prefix /24)
        Gateway    : 192.168.1.1
+       Allocation : Dynamic (DHCP)
  IPv6 Config   :
    [1] Address    : fe80::1000:2000:3000:4000
        Prefix Len : /64
        Gateway    : fe80::1
+       Allocation : Dynamic (DHCP)
  DNS Servers   :
    ├── 1.1.1.1
    └── 8.8.8.8
@@ -139,7 +143,8 @@ cargo build --release
         "prefix_len": 24,
         "gateways": [
           "192.168.1.1"
-        ]
+        ],
+        "allocation": "Dynamic"
       }
     ],
     "ipv6_addresses": [
@@ -148,11 +153,13 @@ cargo build --release
         "prefix_len": 64,
         "gateways": [
           "fe80::1"
-        ]
+        ],
+        "allocation": "Dynamic"
       }
     ],
     "status": "Up",
     "interface_type": "WiFi",
+    "allocation": "Dynamic",
     "link_speed": 1200000000,
     "dns_servers": [
       "1.1.1.1",

@@ -1,11 +1,29 @@
 use crate::shared::{
-    InterfaceStats, InterfaceStatus, InterfaceType, Ipv4Info, Ipv6Info, NetworkInterface,
-    NetworkInterfaces,
+    InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info, Ipv6Info,
+    NetworkInterface, NetworkInterfaces,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
+
+fn check_is_dhcp_macos(iface: &str) -> bool {
+    if iface.starts_with("lo") {
+        return false;
+    }
+    if let Ok(output) = std::process::Command::new("ipconfig")
+        .args(["getpacket", iface])
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            let s = String::from_utf8_lossy(&output.stdout);
+            if s.contains("op =") || s.contains("yiaddr") || s.contains("server_identifier") {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// 解析 IPv4 默认路由 (执行 route get default)
 fn get_macos_default_route_v4() -> Option<(String, Ipv4Addr)> {
@@ -184,11 +202,21 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     }
                 }
 
+                let is_dhcp = check_is_dhcp_macos(&ifa_name);
+                let alloc = if ifa_name.starts_with("lo") {
+                    IpAllocation::Static
+                } else if is_dhcp {
+                    IpAllocation::Dynamic
+                } else {
+                    IpAllocation::Static
+                };
+
                 let ipv4_info = Ipv4Info {
                     address: ip,
                     netmask,
                     prefix_len,
                     gateways,
+                    allocation: alloc,
                 };
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
@@ -207,6 +235,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                                 InterfaceStatus::Down
                             },
                             interface_type: InterfaceType::Unknown,
+                            allocation: IpAllocation::Unknown,
                             link_speed: None,
                             dns_servers: Vec::new(),
                             statistics: None,
@@ -231,10 +260,20 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     }
                 }
 
+                let is_dhcp = check_is_dhcp_macos(&ifa_name);
+                let alloc = if ifa_name.starts_with("lo") {
+                    IpAllocation::Static
+                } else if is_dhcp {
+                    IpAllocation::Dynamic
+                } else {
+                    IpAllocation::Static
+                };
+
                 let ipv6_info = Ipv6Info {
                     address: ip,
                     prefix_len,
                     gateways,
+                    allocation: alloc,
                 };
 
                 let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
@@ -253,6 +292,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                                 InterfaceStatus::Down
                             },
                             interface_type: InterfaceType::Unknown,
+                            allocation: IpAllocation::Unknown,
                             link_speed: None,
                             dns_servers: Vec::new(),
                             statistics: None,
@@ -316,6 +356,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                                 InterfaceStatus::Down
                             },
                             interface_type: InterfaceType::Unknown,
+                            allocation: IpAllocation::Unknown,
                             link_speed: None,
                             dns_servers: Vec::new(),
                             statistics: None,
@@ -361,6 +402,25 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
             }
         }
         interface.interface_type = itype;
+
+        let is_dhcp = check_is_dhcp_macos(name);
+        let has_dynamic = interface
+            .ipv4_addresses
+            .iter()
+            .any(|a| a.allocation == IpAllocation::Dynamic)
+            || interface
+                .ipv6_addresses
+                .iter()
+                .any(|a| a.allocation == IpAllocation::Dynamic);
+        interface.allocation = if name.starts_with("lo") {
+            IpAllocation::Static
+        } else if is_dhcp || has_dynamic {
+            IpAllocation::Dynamic
+        } else if !interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty() {
+            IpAllocation::Static
+        } else {
+            IpAllocation::Unknown
+        };
     }
 
     // 分离主网卡与辅助网卡
