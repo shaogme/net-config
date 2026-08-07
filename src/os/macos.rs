@@ -591,9 +591,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                 let evidence = allocation_evidence
                     .entry(ifa_name.clone())
                     .or_insert_with(|| collect_macos_allocation_evidence(&ifa_name));
-                let alloc = if ifa_name.starts_with("lo") {
-                    IpAllocation::Other
-                } else if ip.is_unicast_link_local() {
+                let alloc = if ifa_name.starts_with("lo") || ip.is_unicast_link_local() {
                     IpAllocation::Other
                 } else if evidence.dhcpv6_addresses.contains(&ip) {
                     IpAllocation::Dhcpv6
