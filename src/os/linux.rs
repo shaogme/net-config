@@ -1,6 +1,7 @@
 use crate::shared::{
     AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
+    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route, select_primary_interface,
+    sort_interfaces, sort_routes,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -232,26 +233,32 @@ fn parse_ipv6_permanent_map()
     Ok(map)
 }
 
+fn empty_linux_interface(name: &str, is_up: bool) -> NetworkInterface {
+    NetworkInterface {
+        name: name.to_string(),
+        description: name.to_string(),
+        mac_address: None,
+        ipv4_addresses: Vec::new(),
+        ipv6_addresses: Vec::new(),
+        routes: Vec::new(),
+        status: if is_up {
+            InterfaceStatus::Up
+        } else {
+            InterfaceStatus::Down
+        },
+        interface_type: InterfaceType::Unknown,
+        allocation: IpAllocation::Unknown,
+        link_speed: None,
+        dns_servers: Vec::new(),
+        statistics: None,
+    }
+}
+
 pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取默认路由及网关列表
     let v4_routes = parse_ipv4_routes()?;
     let v6_routes = parse_ipv6_routes()?;
     let v6_perm_map = parse_ipv6_permanent_map()?;
-
-    // 找出 Metric 最小的默认路由作为主网卡接口；点对点默认路由可以没有网关。
-    let primary_v4_iface = v4_routes
-        .iter()
-        .filter(|r| r.is_default)
-        .min_by_key(|r| (r.metric, r.iface.as_str()))
-        .map(|r| r.iface.clone());
-
-    let primary_v6_iface = v6_routes
-        .iter()
-        .filter(|r| r.is_default)
-        .min_by_key(|r| (r.metric, r.iface.as_str()))
-        .map(|r| r.iface.clone());
-
-    let primary_iface = primary_v4_iface.or(primary_v6_iface);
 
     // 2. 调用 getifaddrs
     let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
@@ -280,8 +287,14 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
 
         if !ifa.ifa_addr.is_null() {
             let sa_family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
+            let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
 
-            if sa_family == libc::AF_INET {
+            if sa_family == libc::AF_PACKET {
+                // AF_PACKET 可覆盖没有 IPv4/IPv6 地址的接口，后处理再补充链路信息。
+                interface_map
+                    .entry(ifa_name.clone())
+                    .or_insert_with(|| empty_linux_interface(&ifa_name, is_up));
+            } else if sa_family == libc::AF_INET {
                 let sock_in = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
                 let ip_bytes = sock_in.sin_addr.s_addr.to_ne_bytes();
                 let ip = Ipv4Addr::from(ip_bytes);
@@ -312,28 +325,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     allocation: alloc,
                 };
 
-                let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry =
-                    interface_map
-                        .entry(ifa_name.clone())
-                        .or_insert_with(|| NetworkInterface {
-                            name: ifa_name.clone(),
-                            description: ifa_name.clone(),
-                            mac_address: None,
-                            ipv4_addresses: Vec::new(),
-                            ipv6_addresses: Vec::new(),
-                            routes: Vec::new(),
-                            status: if is_up {
-                                InterfaceStatus::Up
-                            } else {
-                                InterfaceStatus::Down
-                            },
-                            interface_type: InterfaceType::Unknown,
-                            allocation: IpAllocation::Unknown,
-                            link_speed: None,
-                            dns_servers: Vec::new(),
-                            statistics: None,
-                        });
+                let entry = interface_map
+                    .entry(ifa_name.clone())
+                    .or_insert_with(|| empty_linux_interface(&ifa_name, is_up));
                 entry.ipv4_addresses.push(ipv4_info);
             } else if sa_family == libc::AF_INET6 {
                 let sock_in6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
@@ -368,28 +362,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     allocation: alloc,
                 };
 
-                let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry =
-                    interface_map
-                        .entry(ifa_name.clone())
-                        .or_insert_with(|| NetworkInterface {
-                            name: ifa_name.clone(),
-                            description: ifa_name.clone(),
-                            mac_address: None,
-                            ipv4_addresses: Vec::new(),
-                            ipv6_addresses: Vec::new(),
-                            routes: Vec::new(),
-                            status: if is_up {
-                                InterfaceStatus::Up
-                            } else {
-                                InterfaceStatus::Down
-                            },
-                            interface_type: InterfaceType::Unknown,
-                            allocation: IpAllocation::Unknown,
-                            link_speed: None,
-                            dns_servers: Vec::new(),
-                            statistics: None,
-                        });
+                let entry = interface_map
+                    .entry(ifa_name.clone())
+                    .or_insert_with(|| empty_linux_interface(&ifa_name, is_up));
                 entry.ipv6_addresses.push(ipv6_info);
             }
         }
@@ -540,7 +515,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     .map(LinuxRouteV6::to_route),
             )
             .collect();
-        crate::shared::sort_routes(&mut interface.routes);
+        sort_routes(&mut interface.routes);
 
         // 6. 确定网卡协议栈/IP 分配方式
         let is_dhcp = is_dhcp_interface_linux(name);
@@ -563,26 +538,10 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
         };
     }
 
-    let mut primary: Option<NetworkInterface> = None;
-    let mut other: Vec<NetworkInterface> = Vec::new();
-
-    for iface in interface_map.into_values() {
-        let is_pri = primary_iface.as_ref() == Some(&iface.name);
-        if is_pri && primary.is_none() {
-            primary = Some(iface);
-        } else {
-            other.push(iface);
-        }
-    }
-
-    // 保底：若无主网卡，选择第一个非环回有IP绑定的网卡作为 primary
-    if primary.is_none()
-        && let Some(pos) = other.iter().position(|i| {
-            i.name != "lo" && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
-        })
-    {
-        primary = Some(other.remove(pos));
-    }
+    let mut interfaces: Vec<NetworkInterface> = interface_map.into_values().collect();
+    sort_interfaces(&mut interfaces);
+    let mut primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
+    let other = interfaces;
 
     // 7. 解析并分配全局 DNS 给主网卡
     fn parse_dns_servers() -> Result<Vec<IpAddr>, NetworkError> {

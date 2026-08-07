@@ -1,6 +1,7 @@
 use crate::shared::{
     AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
+    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route, select_primary_interface,
+    sort_interfaces, sort_routes,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -353,35 +354,20 @@ fn parse_dns_servers() -> Result<Vec<IpAddr>, NetworkError> {
 pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取路由表；netstat 提供完整路由，route get 作为默认路由回退。
     let mut routes = get_macos_route_table("inet", AddressFamily::Ipv4)?;
-    let default_v4 = routes.iter().find(|route| route.is_default).cloned();
-    if default_v4.is_none()
+    if !routes.iter().any(|route| route.is_default)
         && let Some(route) = get_macos_default_route_v4()?
     {
         routes.push(route);
     }
 
     let mut v6_routes = get_macos_route_table("inet6", AddressFamily::Ipv6)?;
-    let default_v6 = v6_routes.iter().find(|route| route.is_default).cloned();
-    if default_v6.is_none()
+    if !v6_routes.iter().any(|route| route.is_default)
         && let Some(route) = get_macos_default_route_v6()?
     {
         v6_routes.push(route);
     }
     routes.extend(v6_routes);
-    crate::shared::sort_routes(&mut routes);
-
-    let default_v4 = routes
-        .iter()
-        .find(|route| route.family == AddressFamily::Ipv4 && route.is_default)
-        .cloned();
-    let default_v6 = routes
-        .iter()
-        .find(|route| route.family == AddressFamily::Ipv6 && route.is_default)
-        .cloned();
-    let primary_iface = default_v4
-        .as_ref()
-        .map(|route| route.interface.clone())
-        .or_else(|| default_v6.as_ref().map(|route| route.interface.clone()));
+    sort_routes(&mut routes);
 
     // 2. 加载硬件端口物理映射
     let hardware_types = get_macos_interface_types()?;
@@ -643,7 +629,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             .filter(|route| route.interface == *name)
             .cloned()
             .collect();
-        crate::shared::sort_routes(&mut interface.routes);
+        sort_routes(&mut interface.routes);
 
         let is_dhcp = check_is_dhcp_macos(name)?;
         let has_dynamic = interface
@@ -665,28 +651,10 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
         };
     }
 
-    // 分离主网卡与辅助网卡
-    let mut primary: Option<NetworkInterface> = None;
-    let mut other: Vec<NetworkInterface> = Vec::new();
-
-    for iface in interface_map.into_values() {
-        let is_pri = primary_iface.as_ref() == Some(&iface.name);
-        if is_pri && primary.is_none() {
-            primary = Some(iface);
-        } else {
-            other.push(iface);
-        }
-    }
-
-    // 保底：若无主网卡，选择第一个非环回且绑定了IP地址的网卡
-    if primary.is_none()
-        && let Some(pos) = other.iter().position(|i| {
-            !i.name.starts_with("lo")
-                && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
-        })
-    {
-        primary = Some(other.remove(pos));
-    }
+    let mut interfaces: Vec<NetworkInterface> = interface_map.into_values().collect();
+    sort_interfaces(&mut interfaces);
+    let mut primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
+    let other = interfaces;
 
     // 5. 分配全局 DNS 信息给主网卡
     let dns_list = parse_dns_servers()?;

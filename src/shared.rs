@@ -79,6 +79,96 @@ pub fn sort_routes(routes: &mut [Route]) {
     });
 }
 
+/// 按接口名称排序，避免平台 API 或 HashMap 的遍历顺序泄漏到输出。
+pub fn sort_interfaces(interfaces: &mut [NetworkInterface]) {
+    interfaces.sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+/// 选择主接口并返回其在输入切片中的索引。
+///
+/// 有效默认路由优先于无路由接口；同类候选再依次比较默认路由 metric、
+/// 接口状态、是否为环回、接口类型和名称。没有默认路由时，只考虑非环回且
+/// 至少绑定一个 IP 地址的接口，避免无地址接口被错误地选为主接口。
+pub fn select_primary_interface(interfaces: &[NetworkInterface]) -> Option<usize> {
+    let has_default_route = interfaces.iter().any(interface_has_default_route);
+    interfaces
+        .iter()
+        .enumerate()
+        .filter(|(_, interface)| {
+            if has_default_route {
+                interface_has_default_route(interface)
+            } else {
+                !is_loopback_interface(interface) && interface_has_addresses(interface)
+            }
+        })
+        .min_by(|(_, left), (_, right)| {
+            primary_interface_key(left).cmp(&primary_interface_key(right))
+        })
+        .map(|(index, _)| index)
+}
+
+fn interface_has_default_route(interface: &NetworkInterface) -> bool {
+    interface.routes.iter().any(|route| {
+        route.interface == interface.name
+            && route.is_default
+            && route.destination.is_unspecified()
+            && route.prefix_len == 0
+    })
+}
+
+fn interface_has_addresses(interface: &NetworkInterface) -> bool {
+    !interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty()
+}
+
+fn is_loopback_interface(interface: &NetworkInterface) -> bool {
+    interface.interface_type == InterfaceType::Loopback || interface.name.starts_with("lo")
+}
+
+fn primary_interface_key(interface: &NetworkInterface) -> (u8, u32, u8, u8, u8, &str) {
+    let default_route = interface
+        .routes
+        .iter()
+        .filter(|route| {
+            route.interface == interface.name
+                && route.is_default
+                && route.destination.is_unspecified()
+                && route.prefix_len == 0
+        })
+        .min_by_key(|route| route.metric.unwrap_or(u32::MAX));
+
+    (
+        u8::from(default_route.is_none()),
+        default_route
+            .and_then(|route| route.metric)
+            .unwrap_or(u32::MAX),
+        interface_status_rank(interface.status),
+        u8::from(is_loopback_interface(interface)),
+        interface_type_rank(interface.interface_type),
+        interface.name.as_str(),
+    )
+}
+
+fn interface_status_rank(status: InterfaceStatus) -> u8 {
+    match status {
+        InterfaceStatus::Up => 0,
+        InterfaceStatus::Testing => 1,
+        InterfaceStatus::Unknown => 2,
+        InterfaceStatus::Down => 3,
+    }
+}
+
+fn interface_type_rank(interface_type: InterfaceType) -> u8 {
+    match interface_type {
+        InterfaceType::Ethernet => 0,
+        InterfaceType::WiFi => 1,
+        InterfaceType::Other => 2,
+        InterfaceType::Unknown => 3,
+        InterfaceType::Virtual => 4,
+        InterfaceType::Tunnel => 5,
+        InterfaceType::Loopback => 6,
+    }
+}
+
 /// 流量数据吞吐统计
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct InterfaceStats {
@@ -345,6 +435,50 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
 mod tests {
     use super::*;
 
+    fn test_interface(
+        name: &str,
+        status: InterfaceStatus,
+        interface_type: InterfaceType,
+        address: Option<Ipv4Addr>,
+        routes: Vec<Route>,
+    ) -> NetworkInterface {
+        NetworkInterface {
+            name: name.to_string(),
+            description: name.to_string(),
+            mac_address: None,
+            ipv4_addresses: address
+                .into_iter()
+                .map(|address| Ipv4Info {
+                    address,
+                    netmask: Ipv4Addr::new(255, 255, 255, 0),
+                    prefix_len: 24,
+                    allocation: IpAllocation::Unknown,
+                })
+                .collect(),
+            ipv6_addresses: Vec::new(),
+            routes,
+            status,
+            interface_type,
+            allocation: IpAllocation::Unknown,
+            link_speed: None,
+            dns_servers: Vec::new(),
+            statistics: None,
+        }
+    }
+
+    fn default_route(interface: &str, metric: Option<u32>) -> Route {
+        Route {
+            family: AddressFamily::Ipv4,
+            destination: Ipv4Addr::UNSPECIFIED.into(),
+            prefix_len: 0,
+            gateway: None,
+            gateway_scope: None,
+            interface: interface.to_string(),
+            metric,
+            is_default: true,
+        }
+    }
+
     #[test]
     fn test_get_network_interfaces() {
         let res = get_network_interfaces();
@@ -401,5 +535,74 @@ mod tests {
 
         let error = NetworkError::unsupported("test", "network interface collection");
         assert_eq!(error.code(), "unsupported");
+    }
+
+    #[test]
+    fn primary_selection_prefers_default_route_metric() {
+        let interfaces = vec![
+            test_interface(
+                "eth0",
+                InterfaceStatus::Up,
+                InterfaceType::Ethernet,
+                Some(Ipv4Addr::new(192, 168, 1, 2)),
+                vec![default_route("eth0", Some(200))],
+            ),
+            test_interface(
+                "wlan0",
+                InterfaceStatus::Down,
+                InterfaceType::WiFi,
+                Some(Ipv4Addr::new(192, 168, 1, 3)),
+                vec![default_route("wlan0", Some(100))],
+            ),
+        ];
+
+        assert_eq!(select_primary_interface(&interfaces), Some(1));
+    }
+
+    #[test]
+    fn primary_selection_without_default_route_is_deterministic() {
+        let mut interfaces = vec![
+            test_interface(
+                "zeta0",
+                InterfaceStatus::Up,
+                InterfaceType::Ethernet,
+                Some(Ipv4Addr::new(192, 168, 1, 2)),
+                Vec::new(),
+            ),
+            test_interface(
+                "alpha0",
+                InterfaceStatus::Up,
+                InterfaceType::Ethernet,
+                Some(Ipv4Addr::new(192, 168, 1, 3)),
+                Vec::new(),
+            ),
+        ];
+
+        sort_interfaces(&mut interfaces);
+
+        assert_eq!(interfaces[0].name, "alpha0");
+        assert_eq!(select_primary_interface(&interfaces), Some(0));
+    }
+
+    #[test]
+    fn primary_selection_ignores_no_address_interfaces_without_routes() {
+        let interfaces = vec![
+            test_interface(
+                "eth0",
+                InterfaceStatus::Up,
+                InterfaceType::Ethernet,
+                Some(Ipv4Addr::new(192, 168, 1, 2)),
+                Vec::new(),
+            ),
+            test_interface(
+                "eth1",
+                InterfaceStatus::Up,
+                InterfaceType::Ethernet,
+                None,
+                Vec::new(),
+            ),
+        ];
+
+        assert_eq!(select_primary_interface(&interfaces), Some(0));
     }
 }

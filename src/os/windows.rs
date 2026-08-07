@@ -11,7 +11,8 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use crate::shared::{
     AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
+    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route, select_primary_interface,
+    sort_interfaces, sort_routes,
 };
 use std::net::IpAddr;
 
@@ -245,7 +246,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             })
             .map(|route| route.clone_for_interface(&name))
             .collect::<Vec<Route>>();
-        crate::shared::sort_routes(&mut interface_routes);
+        sort_routes(&mut interface_routes);
 
         let mut ipv4_addresses = Vec::new();
         let mut ipv6_addresses = Vec::new();
@@ -427,14 +428,11 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
         current = adapter.Next;
     }
 
-    // 保底：若无主网卡，选择第一个非环回有IP绑定的网卡作为 primary
+    sort_interfaces(&mut other);
     if primary.is_none()
-        && let Some(pos) = other.iter().position(|i| {
-            !i.description.to_lowercase().contains("loopback")
-                && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
-        })
+        && let Some(index) = select_primary_interface(&other)
     {
-        primary = Some(other.remove(pos));
+        primary = Some(other.remove(index));
     }
 
     Ok(NetworkInterfaces { primary, other })
