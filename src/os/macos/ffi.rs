@@ -56,7 +56,6 @@ fn read_bounded_c_string(
 
 fn read_sockaddr_header(
     address: *const libc::sockaddr,
-    context: &str,
 ) -> Result<Option<(usize, i32)>, NetworkError> {
     if address.is_null() {
         return Ok(None);
@@ -68,30 +67,21 @@ fn read_sockaddr_header(
     let minimum_len = (length_offset + size_of::<u8>()).max(family_offset + size_of::<u8>());
     let sockaddr_len = unsafe { ptr::read_unaligned(base.add(length_offset)) as usize };
     if sockaddr_len < minimum_len {
-        return Err(NetworkError::invariant(format!(
-            "{} is shorter than its sockaddr header",
-            context
-        )));
+        return Ok(None);
     }
     let family = unsafe { ptr::read_unaligned(base.add(family_offset)) } as i32;
     Ok(Some((sockaddr_len, family)))
 }
 
-fn read_sockaddr(
-    address: *const libc::sockaddr,
-    context: &str,
-) -> Result<Option<MacosAddress>, NetworkError> {
-    let Some((sockaddr_len, family)) = read_sockaddr_header(address, context)? else {
+fn read_sockaddr(address: *const libc::sockaddr) -> Result<Option<MacosAddress>, NetworkError> {
+    let Some((sockaddr_len, family)) = read_sockaddr_header(address)? else {
         return Ok(None);
     };
 
     match family {
         libc::AF_INET => {
             if sockaddr_len < size_of::<libc::sockaddr_in>() {
-                return Err(NetworkError::invariant(format!(
-                    "{} is shorter than sockaddr_in",
-                    context
-                )));
+                return Ok(None);
             }
             let sockaddr = unsafe { ptr::read_unaligned(address.cast::<libc::sockaddr_in>()) };
             Ok(Some(MacosAddress::Ipv4(Ipv4Addr::from(
@@ -100,10 +90,7 @@ fn read_sockaddr(
         }
         libc::AF_INET6 => {
             if sockaddr_len < size_of::<libc::sockaddr_in6>() {
-                return Err(NetworkError::invariant(format!(
-                    "{} is shorter than sockaddr_in6",
-                    context
-                )));
+                return Ok(None);
             }
             let sockaddr = unsafe { ptr::read_unaligned(address.cast::<libc::sockaddr_in6>()) };
             Ok(Some(MacosAddress::Ipv6(Ipv6Addr::from(
@@ -235,8 +222,8 @@ pub(super) fn get_ifaddrs_records() -> Result<Vec<IfaddrsRecord>, NetworkError> 
             current = next;
             continue;
         };
-        let address = read_sockaddr(ifa.ifa_addr, "interface address")?;
-        let netmask = read_sockaddr(ifa.ifa_netmask, "interface netmask")?;
+        let address = read_sockaddr(ifa.ifa_addr)?;
+        let netmask = read_sockaddr(ifa.ifa_netmask)?;
         let link_data = matches!(address, Some(MacosAddress::Link))
             .then(|| read_link_data(ifa.ifa_addr, ifa.ifa_data));
 
