@@ -3,7 +3,8 @@ mod ffi;
 use crate::shared::{
     AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceBuilder, InterfaceStatus,
     InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface,
-    NetworkInterfaces, Route, normalize_interfaces, parse_resolv_conf,
+    NetworkInterfaces, Route, ipv4_prefix_len, ipv6_prefix_len, normalize_interfaces,
+    parse_resolv_conf,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -524,8 +525,10 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             ffi::MacosAddress::Ipv4(ip) => {
                 let (netmask, prefix_len) = match netmask {
                     Some(ffi::MacosAddress::Ipv4(mask)) => {
-                        let bytes = mask.octets();
-                        (mask, u32::from_ne_bytes(bytes).count_ones() as u8)
+                        let prefix_len = ipv4_prefix_len(mask).ok_or_else(|| {
+                            NetworkError::parse("macOS IPv4 interface netmask", mask.to_string())
+                        })?;
+                        (mask, prefix_len)
                     }
                     _ => (Ipv4Addr::new(255, 255, 255, 0), 24),
                 };
@@ -539,10 +542,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             ffi::MacosAddress::Ipv6(ip) => {
                 let prefix_len = match netmask {
                     Some(ffi::MacosAddress::Ipv6(mask)) => {
-                        mask.octets()
-                            .iter()
-                            .map(|byte| byte.count_ones())
-                            .sum::<u32>() as u8
+                        ipv6_prefix_len(mask).ok_or_else(|| {
+                            NetworkError::parse("macOS IPv6 interface netmask", mask.to_string())
+                        })?
                     }
                     _ => 64,
                 };
@@ -656,6 +658,23 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].gateway, None);
         assert!(!routes[0].is_default);
+    }
+
+    #[test]
+    fn rejects_invalid_route_prefix_and_gateway_fixtures() {
+        let prefix_error = parse_macos_route_table(
+            "Destination Gateway Flags Netif Expire\n192.0.2.0/33 192.0.2.1 UGSc en0",
+            AddressFamily::Ipv4,
+        )
+        .expect_err("invalid IPv4 route prefix must fail");
+        assert_eq!(prefix_error.code(), "parse");
+
+        let gateway_error = parse_macos_route_table(
+            "Destination Gateway Flags Netif Expire\ndefault invalid UGSc en0",
+            AddressFamily::Ipv4,
+        )
+        .expect_err("invalid IPv4 gateway must fail");
+        assert_eq!(gateway_error.code(), "parse");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use crate::shared::{
     AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceBuilder, InterfaceStats,
     InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError,
-    NetworkInterface, NetworkInterfaces, Route, normalize_interfaces, parse_resolv_conf,
+    NetworkInterface, NetworkInterfaces, Route, ipv4_prefix_len, ipv6_prefix_len,
+    normalize_interfaces, parse_resolv_conf,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -53,14 +54,17 @@ fn parse_ipv4_route_line(line: &str) -> Result<Option<LinuxRouteV4>, NetworkErro
         .map_err(|_| NetworkError::parse("Linux IPv4 route netmask", parts[7]))?;
     let destination = Ipv4Addr::from(destination_raw.to_ne_bytes());
     let gateway = Ipv4Addr::from(gateway_raw.to_ne_bytes());
+    let netmask = Ipv4Addr::from(mask_raw.to_ne_bytes());
+    let prefix_len = ipv4_prefix_len(netmask)
+        .ok_or_else(|| NetworkError::parse("Linux IPv4 route netmask", parts[7]))?;
 
     Ok(Some(LinuxRouteV4 {
         iface: parts[0].to_string(),
         destination,
-        prefix_len: mask_raw.count_ones() as u8,
+        prefix_len,
         gateway: (!gateway.is_unspecified()).then_some(gateway),
         metric,
-        is_default: destination.is_unspecified() && mask_raw == 0,
+        is_default: destination.is_unspecified() && prefix_len == 0,
     }))
 }
 
@@ -117,9 +121,10 @@ fn parse_hex_to_ipv6(hex_str: &str) -> Result<Ipv6Addr, NetworkError> {
         ));
     }
     let mut bytes = [0u8; 16];
-    for i in 0..16 {
-        let byte_str = &hex_str[i * 2..i * 2 + 2];
-        bytes[i] = u8::from_str_radix(byte_str, 16)
+    for (index, chunk) in hex_str.as_bytes().chunks_exact(2).enumerate() {
+        let byte_str = std::str::from_utf8(chunk)
+            .map_err(|_| NetworkError::parse("Linux IPv6 hexadecimal address", hex_str))?;
+        bytes[index] = u8::from_str_radix(byte_str, 16)
             .map_err(|_| NetworkError::parse("Linux IPv6 hexadecimal address", byte_str))?;
     }
     Ok(Ipv6Addr::from(bytes))
@@ -349,23 +354,41 @@ fn collect_linux_dhcp_evidence() -> HashMap<String, LinuxDhcpEvidence> {
 
 fn parse_ipv6_flags_map() -> Result<HashMap<(String, Ipv6Addr), u32>, NetworkError> {
     const PATH: &str = "/proc/net/if_inet6";
-    let mut map = HashMap::new();
-    let file = File::open(PATH)
+    let contents = std::fs::read_to_string(PATH)
         .map_err(|source| NetworkError::io("read IPv6 interface table", PATH, source))?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line =
-            line.map_err(|source| NetworkError::io("read IPv6 interface table", PATH, source))?;
+    parse_ipv6_flags(&contents)
+}
+
+fn parse_ipv6_flags(contents: &str) -> Result<HashMap<(String, Ipv6Addr), u32>, NetworkError> {
+    let mut map = HashMap::new();
+    for line in contents.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 6 {
-            let ip = parse_hex_to_ipv6(parts[0])?;
-            let flags = u32::from_str_radix(parts[4], 16)
-                .map_err(|_| NetworkError::parse("Linux IPv6 interface flags", parts[4]))?;
-            let iface = parts[5].to_string();
-            map.insert((iface, ip), flags);
+        if parts.len() < 6 {
+            continue;
         }
+        let ip = parse_hex_to_ipv6(parts[0])?;
+        let flags = u32::from_str_radix(parts[4], 16)
+            .map_err(|_| NetworkError::parse("Linux IPv6 interface flags", parts[4]))?;
+        let iface = parts[5].to_string();
+        map.insert((iface, ip), flags);
     }
     Ok(map)
+}
+
+fn linux_ipv4_allocation(
+    interface: &str,
+    address: Ipv4Addr,
+    evidence: Option<&LinuxDhcpEvidence>,
+) -> IpAllocation {
+    if interface.starts_with("lo") {
+        IpAllocation::Other
+    } else if evidence.is_some_and(|value| value.ipv4_addresses.contains(&address))
+        || evidence.is_some_and(|value| value.ipv4_interfaces.contains(interface))
+    {
+        IpAllocation::Dhcpv4
+    } else {
+        IpAllocation::Unknown
+    }
 }
 
 fn linux_ipv6_allocation(
@@ -620,6 +643,16 @@ fn empty_linux_interface(name: &str, is_up: bool) -> InterfaceBuilder {
     )
 }
 
+struct IfaddrsGuard(*mut libc::ifaddrs);
+
+impl Drop for IfaddrsGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { libc::freeifaddrs(self.0) };
+        }
+    }
+}
+
 pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取默认路由及网关列表
     let v4_routes = parse_ipv4_routes()?;
@@ -636,6 +669,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             .map_or(0, |value| value as u32);
         return Err(NetworkError::api("getifaddrs", code));
     }
+    let _ifaddrs_guard = IfaddrsGuard(ifap);
     let mut interface_map: HashMap<String, InterfaceBuilder> = HashMap::new();
 
     let mut current = ifap;
@@ -671,23 +705,12 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     let mask_in = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in) };
                     let mask_bytes = mask_in.sin_addr.s_addr.to_ne_bytes();
                     netmask = Ipv4Addr::from(mask_bytes);
-                    let mask_u32 = u32::from_ne_bytes(mask_bytes);
-                    prefix_len = mask_u32.count_ones() as u8;
+                    prefix_len = ipv4_prefix_len(netmask).ok_or_else(|| {
+                        NetworkError::parse("Linux IPv4 interface netmask", netmask.to_string())
+                    })?;
                 }
 
-                let alloc = if ifa_name.starts_with("lo") {
-                    IpAllocation::Other
-                } else if dhcp_evidence
-                    .get(&ifa_name)
-                    .is_some_and(|value| value.ipv4_addresses.contains(&ip))
-                    || dhcp_evidence
-                        .get(&ifa_name)
-                        .is_some_and(|value| value.ipv4_interfaces.contains(&ifa_name))
-                {
-                    IpAllocation::Dhcpv4
-                } else {
-                    IpAllocation::Unknown
-                };
+                let alloc = linux_ipv4_allocation(&ifa_name, ip, dhcp_evidence.get(&ifa_name));
 
                 let ipv4_info = Ipv4Info {
                     address: ip,
@@ -709,7 +732,12 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                 if !ifa.ifa_netmask.is_null() {
                     let mask_in6 = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in6) };
                     let mask_bytes = mask_in6.sin6_addr.s6_addr;
-                    prefix_len = mask_bytes.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
+                    prefix_len = ipv6_prefix_len(Ipv6Addr::from(mask_bytes)).ok_or_else(|| {
+                        NetworkError::parse(
+                            "Linux IPv6 interface netmask",
+                            Ipv6Addr::from(mask_bytes).to_string(),
+                        )
+                    })?;
                 }
 
                 let alloc = linux_ipv6_allocation(
@@ -732,10 +760,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             }
         }
         current = ifa.ifa_next;
-    }
-
-    if !ifap.is_null() {
-        unsafe { libc::freeifaddrs(ifap) };
     }
 
     // 辅助函数：读取流量统计
@@ -863,6 +887,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_contiguous_ipv4_route_masks() {
+        let result = parse_ipv4_route_line("eth0 0000A8C0 0100A8C0 0003 0 0 100 00FF00FF 0 0 0");
+
+        assert!(matches!(result, Err(error) if error.code() == "parse"));
+    }
+
+    #[test]
     fn parses_ipv6_route_and_preserves_interface_scope() {
         let route = parse_ipv6_route_line(
             "20010db8000000000000000000000000 40 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000010 00000000 00000000 00000001 eth0",
@@ -883,6 +914,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_ipv6_default_route_fixture_without_gateway() {
+        let route = parse_ipv6_route_line(
+            "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000000 00000000 00000000 eth0",
+        )
+        .expect("route parsing should not fail")
+        .expect("default route should parse");
+
+        assert_eq!(route.destination, Ipv6Addr::UNSPECIFIED);
+        assert_eq!(route.prefix_len, 0);
+        assert_eq!(route.gateway, None);
+        assert!(route.is_default);
+    }
+
+    #[test]
+    fn rejects_malformed_ipv6_hex_fixture_without_panicking() {
+        let malformed = "é000000000000000000000000000000";
+        assert!(parse_hex_to_ipv6(malformed).is_err());
+    }
+
+    #[test]
+    fn parses_ipv6_interface_flags_from_proc_fixture() {
+        let flags = parse_ipv6_flags(
+            "20010db8000000000000000000000010 0001 40 00 0800  eth0\nfe800000000000000000000000000001 0001 40 20 0000  eth0\n",
+        )
+        .expect("IPv6 interface fixture should parse");
+
+        let address = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+        assert_eq!(flags.get(&("eth0".to_string(), address)), Some(&0x0800));
+    }
+
+    #[test]
     fn parses_dhcp_lease_addresses_by_family() {
         let (ipv4, ipv6) = parse_lease_addresses(
             "ADDRESS=192.0.2.10\nfixed-address 192.0.2.10; iaaddr 2001:db8::10/64; option routers 192.0.2.1;",
@@ -899,6 +961,30 @@ mod tests {
 
         assert!(evidence.ipv4_interfaces.contains("eth0"));
         assert!(evidence.ipv6_interfaces.contains("eth0"));
+    }
+
+    #[test]
+    fn keeps_dhcp_and_static_addresses_distinct_before_aggregation() {
+        let mut evidence = LinuxDhcpEvidence::default();
+        evidence.ipv4_addresses.insert(Ipv4Addr::new(192, 0, 2, 10));
+
+        assert_eq!(
+            linux_ipv4_allocation("eth0", Ipv4Addr::new(192, 0, 2, 10), Some(&evidence),),
+            IpAllocation::Dhcpv4
+        );
+        assert_eq!(
+            linux_ipv4_allocation("eth0", Ipv4Addr::new(192, 0, 2, 11), Some(&evidence),),
+            IpAllocation::Unknown
+        );
+        assert_eq!(
+            linux_ipv6_allocation(
+                "eth0",
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                None,
+                Some(&evidence),
+            ),
+            IpAllocation::Other
+        );
     }
 
     #[test]

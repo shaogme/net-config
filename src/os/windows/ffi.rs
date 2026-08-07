@@ -560,6 +560,10 @@ pub(super) fn get_adapters() -> Result<Vec<AdapterData>, NetworkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Networking::WinSock::{
+        IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
+        SOCKADDR_INET,
+    };
 
     #[test]
     fn rejects_physical_address_longer_than_storage() {
@@ -575,6 +579,52 @@ mod tests {
         assert_eq!(
             parse_physical_address(&address, 6).unwrap(),
             Some(vec![1, 2, 3, 4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn converts_fixed_ipv4_and_ipv6_socket_fixtures() {
+        let ipv4 = SOCKADDR_INET {
+            Ipv4: SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: 0,
+                sin_addr: IN_ADDR {
+                    S_un: IN_ADDR_0 {
+                        S_addr: u32::from_ne_bytes([192, 0, 2, 10]),
+                    },
+                },
+                sin_zero: [0; 8],
+            },
+        };
+        assert_eq!(
+            sockaddr_inet_to_ip(&ipv4),
+            Some((
+                AddressFamily::Ipv4,
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                None,
+            ))
+        );
+
+        let ipv6 = SOCKADDR_INET {
+            Ipv6: SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: IN6_ADDR {
+                    u: IN6_ADDR_0 {
+                        Byte: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    },
+                },
+                Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 7 },
+            },
+        };
+        assert_eq!(
+            sockaddr_inet_to_ip(&ipv6),
+            Some((
+                AddressFamily::Ipv6,
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                Some(7),
+            ))
         );
     }
 

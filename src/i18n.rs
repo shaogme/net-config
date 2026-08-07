@@ -1,5 +1,6 @@
 use crate::shared::{DnsSource, IpAllocation};
 use std::sync::OnceLock;
+use unicode_width::UnicodeWidthStr;
 
 pub mod detection;
 
@@ -16,6 +17,25 @@ impl Language {
         match s.to_lowercase().as_str() {
             "zh" | "zh-cn" | "zh_cn" | "chinese" => Some(Language::Zh),
             "en" | "en-us" | "en_us" | "english" => Some(Language::En),
+            _ => None,
+        }
+    }
+
+    /// 从 POSIX/Windows 区域语言环境值解析语言。
+    pub(crate) fn from_locale(value: &str) -> Option<Self> {
+        if let Some(language) = Self::from_str(value) {
+            return Some(language);
+        }
+        let language = value
+            .split(['.', '@'])
+            .next()
+            .unwrap_or(value)
+            .split(['-', '_'])
+            .next()
+            .unwrap_or(value);
+        match language.to_lowercase().as_str() {
+            "zh" => Some(Self::Zh),
+            "en" => Some(Self::En),
             _ => None,
         }
     }
@@ -227,30 +247,10 @@ impl Text {
     }
 }
 
-/// 判断字符是否为东亚宽字符（终端占 2 格）
-fn is_full_width(c: char) -> bool {
-    let cp = c as u32;
-    if cp < 0x80 {
-        return false; // ASCII 字符均为窄字符（1格）
-    }
-    // CJK 统一表意文字及符号范围
-    (0x4E00..=0x9FFF).contains(&cp) || // CJK 统一汉字
-    (0x3000..=0x303F).contains(&cp) || // CJK 标点符号（如实心句号、逗号、全角空格等）
-    (0xFF00..=0xFFEF).contains(&cp) || // 全角英文字母、数字及全角标点符号
-    (0x1100..=0x115F).contains(&cp) || // 谚文母音
-    (0x2E80..=0x3000).contains(&cp) || // CJK 部首及辅助字符
-    (0x3400..=0x4DBF).contains(&cp) || // CJK 扩展 A
-    (0xAC00..=0xD7A3).contains(&cp) || // 谚文音节 (韩文)
-    (0xF900..=0xFAFF).contains(&cp) || // CJK 兼容表意文字
-    (0xFE30..=0xFE4F).contains(&cp) || // CJK 兼容形式
-    (0x20000..=0x3FFFD).contains(&cp) // CJK 扩展 B-G
-}
-
 /// 计算字符串在终端中的真实显示列宽
 pub fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| if is_full_width(c) { 2 } else { 1 })
-        .sum()
+    // 未知终端类型时采用 Unicode 的非 CJK 规则：Ambiguous 字符宽度为 1。
+    UnicodeWidthStr::width(s)
 }
 
 /// 将字符串向右填充空格到指定的终端列宽
@@ -279,16 +279,16 @@ macro_rules! t {
 pub fn localize_status(status: crate::shared::InterfaceStatus) -> &'static str {
     match current() {
         Language::Zh => match status {
-            crate::shared::InterfaceStatus::Up => "🟢 已启用 (Up)",
-            crate::shared::InterfaceStatus::Down => "🔴 未启用 (Down)",
-            crate::shared::InterfaceStatus::Testing => "🟡 测试中 (Testing)",
-            crate::shared::InterfaceStatus::Unknown => "⚪ 未知 (Unknown)",
+            crate::shared::InterfaceStatus::Up => "已启用 (Up)",
+            crate::shared::InterfaceStatus::Down => "未启用 (Down)",
+            crate::shared::InterfaceStatus::Testing => "测试中 (Testing)",
+            crate::shared::InterfaceStatus::Unknown => "未知 (Unknown)",
         },
         Language::En => match status {
-            crate::shared::InterfaceStatus::Up => "🟢 Up",
-            crate::shared::InterfaceStatus::Down => "🔴 Down",
-            crate::shared::InterfaceStatus::Testing => "🟡 Testing",
-            crate::shared::InterfaceStatus::Unknown => "⚪ Unknown",
+            crate::shared::InterfaceStatus::Up => "Up",
+            crate::shared::InterfaceStatus::Down => "Down",
+            crate::shared::InterfaceStatus::Testing => "Testing",
+            crate::shared::InterfaceStatus::Unknown => "Unknown",
         },
     }
 }
@@ -360,5 +360,26 @@ pub fn localize_dns_source(source: DnsSource) -> &'static str {
             DnsSource::Scutil => "scutil",
             DnsSource::WindowsAdapter => "Windows adapter",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_unicode_width_for_combining_emoji_and_labels() {
+        assert_eq!(display_width("中文标签"), 8);
+        assert_eq!(display_width("e\u{0301}"), 1);
+        assert_eq!(display_width("👩‍🔬"), 2);
+        assert_eq!(display_width("#\u{FE0F}"), 2);
+        assert_eq!(display_width("A·B"), 3);
+    }
+
+    #[test]
+    fn pads_by_terminal_columns() {
+        assert_eq!(pad_right("中文", 6), "中文  ");
+        assert_eq!(pad_right("e\u{0301}", 3), "e\u{0301}  ");
+        assert_eq!(pad_right("English", 4), "English");
     }
 }

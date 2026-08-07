@@ -116,6 +116,32 @@ pub fn sort_interfaces(interfaces: &mut [NetworkInterface]) {
     interfaces.sort_by(|left, right| left.name.cmp(&right.name));
 }
 
+/// 将连续 IPv4 子网掩码转换为前缀长度。
+#[allow(dead_code)]
+pub(crate) fn ipv4_prefix_len(netmask: Ipv4Addr) -> Option<u8> {
+    let value = u32::from_be_bytes(netmask.octets());
+    let prefix_len = value.leading_ones() as u8;
+    let expected = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    (value == expected).then_some(prefix_len)
+}
+
+/// 将连续 IPv6 子网掩码转换为前缀长度。
+#[allow(dead_code)]
+pub(crate) fn ipv6_prefix_len(netmask: Ipv6Addr) -> Option<u8> {
+    let value = u128::from_be_bytes(netmask.octets());
+    let prefix_len = value.leading_ones() as u8;
+    let expected = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    (value == expected).then_some(prefix_len)
+}
+
 /// 选择主接口并返回其在输入切片中的索引。
 ///
 /// 有效默认路由优先于无路由接口；同类候选再依次比较默认路由 metric、
@@ -735,7 +761,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_network_interfaces() {
+    #[ignore = "smoke test reads the host network state"]
+    fn smoke_get_network_interfaces() {
         let res = get_network_interfaces();
         assert!(res.is_ok(), "获取网卡信息失败: {:?}", res.err());
 
@@ -764,7 +791,8 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization() {
+    #[ignore = "smoke test reads the host network state"]
+    fn smoke_serialization() {
         let res = get_network_interfaces();
         if let Ok(interfaces) = res {
             let json_res = serde_json::to_string(&interfaces);
@@ -862,6 +890,68 @@ mod tests {
     }
 
     #[test]
+    fn primary_selection_returns_none_without_routes_or_addresses() {
+        let interfaces = vec![test_interface(
+            "eth0",
+            InterfaceStatus::Up,
+            InterfaceType::Ethernet,
+            None,
+            Vec::new(),
+        )];
+
+        assert_eq!(select_primary_interface(&interfaces), None);
+    }
+
+    #[test]
+    fn normalization_handles_multiple_defaults_link_local_and_json_shape() {
+        let mut primary = InterfaceBuilder::new("eth0", "fixture ethernet", InterfaceStatus::Up);
+        primary.set_interface_type(InterfaceType::Ethernet);
+        primary.add_ipv4_address(Ipv4Info {
+            address: Ipv4Addr::new(192, 0, 2, 10),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            prefix_len: 24,
+            allocation: IpAllocation::Dhcpv4,
+        });
+        primary.add_ipv6_address(Ipv6Info {
+            address: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            prefix_len: 64,
+            allocation: IpAllocation::Other,
+        });
+        primary.set_routes(vec![
+            default_route("eth0", Some(200)),
+            default_route("eth0", Some(100)),
+        ]);
+
+        let mut no_address = InterfaceBuilder::new("eth1", "no address", InterfaceStatus::Up);
+        no_address.set_routes(Vec::new());
+
+        let normalized = normalize_interfaces(
+            vec![no_address.build(), primary.build()],
+            DnsConfiguration::from_servers(vec![DnsServer {
+                address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)),
+                interface: None,
+                source: DnsSource::ResolvConf,
+            }]),
+        );
+
+        let primary = normalized
+            .primary
+            .as_ref()
+            .expect("default route should select eth0");
+        assert_eq!(primary.name, "eth0");
+        assert_eq!(primary.routes[0].metric, Some(100));
+        assert_eq!(primary.ipv6_addresses[0].allocation, IpAllocation::Other);
+        assert_eq!(normalized.other.len(), 1);
+        assert_eq!(normalized.other[0].name, "eth1");
+
+        let json = serde_json::to_value(&normalized).expect("fixture should serialize");
+        assert!(json["primary"].is_object());
+        assert!(json["other"].is_array());
+        assert!(json["dns"]["servers"].is_array());
+        assert_eq!(json["dns"]["status"], "available");
+    }
+
+    #[test]
     fn allocation_aggregation_preserves_mixed_sources() {
         assert_eq!(
             aggregate_allocations([IpAllocation::Dhcpv4, IpAllocation::Dhcpv4]),
@@ -915,6 +1005,32 @@ mod tests {
             servers
                 .iter()
                 .all(|server| server.source == DnsSource::ResolvConf)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_dns_nameserver_fixture() {
+        let error = parse_resolv_conf("nameserver not-an-ip\n", DnsSource::ResolvConf)
+            .expect_err("invalid DNS address must fail parsing");
+
+        assert_eq!(error.code(), "parse");
+    }
+
+    #[test]
+    fn accepts_only_contiguous_ipv4_and_ipv6_masks() {
+        assert_eq!(ipv4_prefix_len(Ipv4Addr::new(255, 255, 255, 0)), Some(24));
+        assert_eq!(ipv4_prefix_len(Ipv4Addr::new(255, 0, 255, 0)), None);
+        assert_eq!(
+            ipv6_prefix_len(Ipv6Addr::from([
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0,
+            ])),
+            Some(64)
+        );
+        assert_eq!(
+            ipv6_prefix_len(Ipv6Addr::from([
+                0xff, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ])),
+            None
         );
     }
 }

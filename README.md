@@ -20,8 +20,8 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
 - Flexible Outputs:
   - Polished terminal layout with clean tree-like text alignments.
   - Structured, pretty-printed JSON output for easy shell piping and automation.
-- Built-in Internationalization: Supports English and Chinese. Automatically detects the system language or allows manual overrides. Uses custom string width calculations to ensure perfect alignment for double-width East Asian characters in the terminal.
-- Lightweight & Safe: Zero complex external runtime dependencies; leverages memory-safe Rust and native OS system calls.
+- Built-in Internationalization: Supports English and Chinese. Automatically detects the system language or allows manual overrides. Uses Unicode Standard Annex #11 width rules for terminal alignment, including combining marks and emoji sequences.
+- Lightweight & Safe: Uses a small, verified Unicode width dependency together with memory-safe Rust and native OS system calls.
 
 ## Platform Implementations
 
