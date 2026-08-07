@@ -1,13 +1,14 @@
+mod ffi;
+
 use crate::shared::{
-    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceStats, InterfaceStatus,
-    InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface,
-    NetworkInterfaces, Route, aggregate_allocations, parse_resolv_conf, select_primary_interface,
-    sort_interfaces, sort_routes,
+    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceStatus, InterfaceType,
+    IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
+    aggregate_allocations, parse_resolv_conf, select_primary_interface, sort_interfaces,
+    sort_routes,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
-use std::ptr;
 
 #[derive(Debug, Default)]
 struct MacosAllocationEvidence {
@@ -110,6 +111,36 @@ fn collect_macos_allocation_evidence(iface: &str) -> MacosAllocationEvidence {
         dhcpv4_addresses,
         dhcpv6_addresses,
         slaac_addresses,
+    }
+}
+
+fn macos_ipv4_allocation(
+    interface: &str,
+    address: Ipv4Addr,
+    evidence: Option<&MacosAllocationEvidence>,
+) -> IpAllocation {
+    if interface.starts_with("lo") {
+        IpAllocation::Other
+    } else if evidence.is_some_and(|value| value.dhcpv4_addresses.contains(&address)) {
+        IpAllocation::Dhcpv4
+    } else {
+        IpAllocation::Unknown
+    }
+}
+
+fn macos_ipv6_allocation(
+    interface: &str,
+    address: Ipv6Addr,
+    evidence: Option<&MacosAllocationEvidence>,
+) -> IpAllocation {
+    if interface.starts_with("lo") || address.is_unicast_link_local() {
+        IpAllocation::Other
+    } else if evidence.is_some_and(|value| value.dhcpv6_addresses.contains(&address)) {
+        IpAllocation::Dhcpv6
+    } else if evidence.is_some_and(|value| value.slaac_addresses.contains(&address)) {
+        IpAllocation::Slaac
+    } else {
+        IpAllocation::Unknown
     }
 }
 
@@ -471,6 +502,26 @@ fn collect_macos_dns() -> DnsConfiguration {
     }
 }
 
+fn empty_macos_interface(name: &str, is_up: bool) -> NetworkInterface {
+    NetworkInterface {
+        name: name.to_string(),
+        description: name.to_string(),
+        mac_address: None,
+        ipv4_addresses: Vec::new(),
+        ipv6_addresses: Vec::new(),
+        routes: Vec::new(),
+        status: if is_up {
+            InterfaceStatus::Up
+        } else {
+            InterfaceStatus::Down
+        },
+        interface_type: InterfaceType::Unknown,
+        allocation: IpAllocation::Unknown,
+        link_speed: None,
+        statistics: None,
+    }
+}
+
 /// macOS 下获取所有网卡信息的统一实现
 pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取路由表；netstat 提供完整路由，route get 作为默认路由回退。
@@ -493,226 +544,106 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 2. 加载硬件端口物理映射
     let hardware_types = get_macos_interface_types()?;
 
-    // 3. 遍历 getifaddrs 链表
-    let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
-    let res = unsafe { libc::getifaddrs(&mut ifap) };
-    if res != 0 {
-        let code = std::io::Error::last_os_error()
-            .raw_os_error()
-            .map_or(0, |value| value as u32);
-        return Err(NetworkError::api("getifaddrs", code));
-    }
+    // 3. 由 FFI 适配层验证 getifaddrs 链表和 sockaddr 布局。
+    let records = ffi::get_ifaddrs_records()?;
     let mut interface_map: HashMap<String, NetworkInterface> = HashMap::new();
-    let mut allocation_evidence: HashMap<String, MacosAllocationEvidence> = HashMap::new();
 
-    let mut current = ifap;
-    while !current.is_null() {
-        let ifa = unsafe { &*current };
+    for record in records {
+        let name = record.name;
+        let is_up = (record.flags & libc::IFF_UP as u32) != 0;
+        let address = record.address;
+        let netmask = record.netmask;
+        let link_data = record.link_data;
 
-        let ifa_name = if !ifa.ifa_name.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            current = ifa.ifa_next;
-            continue;
-        };
-
-        if !ifa.ifa_addr.is_null() {
-            let sa_family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
-
-            if sa_family == libc::AF_INET {
-                let sock_in = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-                let ip_bytes = sock_in.sin_addr.s_addr.to_ne_bytes();
-                let ip = Ipv4Addr::from(ip_bytes);
-
-                let mut netmask = Ipv4Addr::new(255, 255, 255, 0);
-                let mut prefix_len = 24;
-                if !ifa.ifa_netmask.is_null() {
-                    let mask_in = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in) };
-                    let mask_bytes = mask_in.sin_addr.s_addr.to_ne_bytes();
-                    netmask = Ipv4Addr::from(mask_bytes);
-                    let mask_u32 = u32::from_ne_bytes(mask_bytes);
-                    prefix_len = mask_u32.count_ones() as u8;
-                }
-
-                let evidence = allocation_evidence
-                    .entry(ifa_name.clone())
-                    .or_insert_with(|| collect_macos_allocation_evidence(&ifa_name));
-                let alloc = if ifa_name.starts_with("lo") {
-                    IpAllocation::Other
-                } else if evidence.dhcpv4_addresses.contains(&ip) {
-                    IpAllocation::Dhcpv4
-                } else {
-                    IpAllocation::Unknown
+        match address {
+            Some(ffi::MacosAddress::Ipv4(ip)) => {
+                let (netmask, prefix_len) = match netmask {
+                    Some(ffi::MacosAddress::Ipv4(mask)) => {
+                        let bytes = mask.octets();
+                        (mask, u32::from_ne_bytes(bytes).count_ones() as u8)
+                    }
+                    _ => (Ipv4Addr::new(255, 255, 255, 0), 24),
                 };
-
-                let ipv4_info = Ipv4Info {
+                let entry = interface_map
+                    .entry(name.clone())
+                    .or_insert_with(|| empty_macos_interface(&name, is_up));
+                entry.ipv4_addresses.push(Ipv4Info {
                     address: ip,
                     netmask,
                     prefix_len,
-                    allocation: alloc,
+                    allocation: IpAllocation::Unknown,
+                });
+            }
+            Some(ffi::MacosAddress::Ipv6(ip)) => {
+                let prefix_len = match netmask {
+                    Some(ffi::MacosAddress::Ipv6(mask)) => {
+                        mask.octets()
+                            .iter()
+                            .map(|byte| byte.count_ones())
+                            .sum::<u32>() as u8
+                    }
+                    _ => 64,
                 };
-
-                let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry =
-                    interface_map
-                        .entry(ifa_name.clone())
-                        .or_insert_with(|| NetworkInterface {
-                            name: ifa_name.clone(),
-                            description: ifa_name.clone(),
-                            mac_address: None,
-                            ipv4_addresses: Vec::new(),
-                            ipv6_addresses: Vec::new(),
-                            routes: Vec::new(),
-                            status: if is_up {
-                                InterfaceStatus::Up
-                            } else {
-                                InterfaceStatus::Down
-                            },
-                            interface_type: InterfaceType::Unknown,
-                            allocation: IpAllocation::Unknown,
-                            link_speed: None,
-                            statistics: None,
-                        });
-                entry.ipv4_addresses.push(ipv4_info);
-            } else if sa_family == libc::AF_INET6 {
-                let sock_in6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
-                let ip_bytes = sock_in6.sin6_addr.s6_addr;
-                let ip = Ipv6Addr::from(ip_bytes);
-
-                let mut prefix_len = 64;
-                if !ifa.ifa_netmask.is_null() {
-                    let mask_in6 = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in6) };
-                    let mask_bytes = mask_in6.sin6_addr.s6_addr;
-                    prefix_len = mask_bytes.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
-                }
-
-                let evidence = allocation_evidence
-                    .entry(ifa_name.clone())
-                    .or_insert_with(|| collect_macos_allocation_evidence(&ifa_name));
-                let alloc = if ifa_name.starts_with("lo") || ip.is_unicast_link_local() {
-                    IpAllocation::Other
-                } else if evidence.dhcpv6_addresses.contains(&ip) {
-                    IpAllocation::Dhcpv6
-                } else if evidence.slaac_addresses.contains(&ip) {
-                    IpAllocation::Slaac
-                } else {
-                    IpAllocation::Unknown
-                };
-
-                let ipv6_info = Ipv6Info {
+                let entry = interface_map
+                    .entry(name.clone())
+                    .or_insert_with(|| empty_macos_interface(&name, is_up));
+                entry.ipv6_addresses.push(Ipv6Info {
                     address: ip,
                     prefix_len,
-                    allocation: alloc,
-                };
-
-                let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry =
-                    interface_map
-                        .entry(ifa_name.clone())
-                        .or_insert_with(|| NetworkInterface {
-                            name: ifa_name.clone(),
-                            description: ifa_name.clone(),
-                            mac_address: None,
-                            ipv4_addresses: Vec::new(),
-                            ipv6_addresses: Vec::new(),
-                            routes: Vec::new(),
-                            status: if is_up {
-                                InterfaceStatus::Up
-                            } else {
-                                InterfaceStatus::Down
-                            },
-                            interface_type: InterfaceType::Unknown,
-                            allocation: IpAllocation::Unknown,
-                            link_speed: None,
-                            statistics: None,
-                        });
-                entry.ipv6_addresses.push(ipv6_info);
-            } else if sa_family == libc::AF_LINK {
-                // macOS 下 AF_LINK 对应数据链路层，用于获取 MAC 地址和流量统计
-                let sdl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
-                let sdl_alen = sdl.sdl_alen as usize;
-                let sdl_nlen = sdl.sdl_nlen as usize;
-
-                let mut mac_address = None;
-                if sdl_alen == 6 {
-                    let mut mac_bytes = [0u8; 6];
-                    for (i, byte) in mac_bytes.iter_mut().enumerate() {
-                        *byte = sdl.sdl_data[sdl_nlen + i] as u8;
+                    allocation: IpAllocation::Unknown,
+                });
+            }
+            Some(ffi::MacosAddress::Link) => {
+                let entry = interface_map
+                    .entry(name.clone())
+                    .or_insert_with(|| empty_macos_interface(&name, is_up));
+                if let Some(link_data) = link_data {
+                    if let Some(mac_bytes) = link_data.mac_address {
+                        let formatted = format!(
+                            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                            mac_bytes[0],
+                            mac_bytes[1],
+                            mac_bytes[2],
+                            mac_bytes[3],
+                            mac_bytes[4],
+                            mac_bytes[5]
+                        );
+                        if formatted != "00:00:00:00:00:00" {
+                            entry.mac_address = Some(formatted);
+                        }
                     }
-                    let formatted = format!(
-                        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                        mac_bytes[0],
-                        mac_bytes[1],
-                        mac_bytes[2],
-                        mac_bytes[3],
-                        mac_bytes[4],
-                        mac_bytes[5]
-                    );
-                    if formatted != "00:00:00:00:00:00" {
-                        mac_address = Some(formatted);
+                    if link_data.statistics.is_some() {
+                        entry.statistics = link_data.statistics;
                     }
-                }
-
-                // 从 if_data 中解析流量数据和接口物理网速
-                let mut statistics = None;
-                let mut link_speed = None;
-                if !ifa.ifa_data.is_null() {
-                    let data = unsafe { &*(ifa.ifa_data as *const libc::if_data) };
-                    statistics = Some(InterfaceStats {
-                        rx_bytes: data.ifi_ibytes as u64,
-                        tx_bytes: data.ifi_obytes as u64,
-                        rx_packets: data.ifi_ipackets as u64,
-                        tx_packets: data.ifi_opackets as u64,
-                    });
-                    if data.ifi_baudrate > 0 {
-                        link_speed = Some(data.ifi_baudrate as u64);
+                    if link_data.link_speed.is_some() {
+                        entry.link_speed = link_data.link_speed;
                     }
-                }
-
-                let is_up = (ifa.ifa_flags as u32 & libc::IFF_UP as u32) != 0;
-                let entry =
-                    interface_map
-                        .entry(ifa_name.clone())
-                        .or_insert_with(|| NetworkInterface {
-                            name: ifa_name.clone(),
-                            description: ifa_name.clone(),
-                            mac_address: None,
-                            ipv4_addresses: Vec::new(),
-                            ipv6_addresses: Vec::new(),
-                            routes: Vec::new(),
-                            status: if is_up {
-                                InterfaceStatus::Up
-                            } else {
-                                InterfaceStatus::Down
-                            },
-                            interface_type: InterfaceType::Unknown,
-                            allocation: IpAllocation::Unknown,
-                            link_speed: None,
-                            statistics: None,
-                        });
-
-                if mac_address.is_some() {
-                    entry.mac_address = mac_address;
-                }
-                if statistics.is_some() {
-                    entry.statistics = statistics;
-                }
-                if link_speed.is_some() {
-                    entry.link_speed = link_speed;
                 }
             }
+            None => {}
         }
-        current = ifa.ifa_next;
     }
 
-    if !ifap.is_null() {
-        unsafe { libc::freeifaddrs(ifap) };
-    }
+    // 地址遍历完成后按接口生成一次分配证据；后处理只读取这份缓存。
+    let allocation_evidence: HashMap<String, MacosAllocationEvidence> = interface_map
+        .iter()
+        .filter(|(name, interface)| {
+            !name.starts_with("lo")
+                && (!interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty())
+        })
+        .map(|(name, _)| (name.clone(), collect_macos_allocation_evidence(name)))
+        .collect();
 
     // 4. 后处理：精细化接口类型分类与映射
     for (name, interface) in &mut interface_map {
+        let evidence = allocation_evidence.get(name);
+        for address in &mut interface.ipv4_addresses {
+            address.allocation = macos_ipv4_allocation(name, address.address, evidence);
+        }
+        for address in &mut interface.ipv6_addresses {
+            address.allocation = macos_ipv6_allocation(name, address.address, evidence);
+        }
+
         let itype;
         if name.starts_with("lo") {
             itype = InterfaceType::Loopback;
@@ -860,5 +791,37 @@ mod tests {
 
         assert_eq!(addresses.len(), 1);
         assert!(addresses.contains(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))));
+    }
+
+    #[test]
+    fn classifies_addresses_from_cached_macos_evidence() {
+        let mut evidence = MacosAllocationEvidence::default();
+        evidence
+            .dhcpv4_addresses
+            .insert(Ipv4Addr::new(192, 0, 2, 10));
+        evidence
+            .slaac_addresses
+            .insert(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10));
+
+        assert_eq!(
+            macos_ipv4_allocation("en0", Ipv4Addr::new(192, 0, 2, 10), Some(&evidence),),
+            IpAllocation::Dhcpv4
+        );
+        assert_eq!(
+            macos_ipv6_allocation(
+                "en0",
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10),
+                Some(&evidence),
+            ),
+            IpAllocation::Slaac
+        );
+        assert_eq!(
+            macos_ipv6_allocation(
+                "en0",
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                Some(&evidence),
+            ),
+            IpAllocation::Other
+        );
     }
 }

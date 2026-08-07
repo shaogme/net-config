@@ -175,6 +175,8 @@ fn parse_ipv6_routes() -> Result<Vec<LinuxRouteV6>, NetworkError> {
 struct LinuxDhcpEvidence {
     ipv4_addresses: HashSet<Ipv4Addr>,
     ipv6_addresses: HashSet<Ipv6Addr>,
+    ipv4_interfaces: HashSet<String>,
+    ipv6_interfaces: HashSet<String>,
 }
 
 fn parse_lease_addresses(content: &str) -> (HashSet<Ipv4Addr>, HashSet<Ipv6Addr>) {
@@ -238,6 +240,64 @@ fn add_linux_lease_evidence(path: &Path, evidence: &mut HashMap<String, LinuxDhc
     entry.ipv6_addresses.extend(ipv6_addresses);
 }
 
+fn add_linux_dhcp_process_evidence(content: &[u8], evidence: &mut LinuxDhcpEvidence) {
+    let mut tokens = content
+        .split(|byte| *byte == 0)
+        .filter(|token| !token.is_empty());
+    let Some(command) = tokens.next() else {
+        return;
+    };
+    let Ok(command) = std::str::from_utf8(command) else {
+        return;
+    };
+    let Some(command) = Path::new(command).file_name() else {
+        return;
+    };
+    let command = command.to_string_lossy();
+    let (ipv4, ipv6) = match command.as_ref() {
+        "dhclient" | "udhcpc" => (true, false),
+        "dhcp6c" => (false, true),
+        "dhcpcd" => (true, true),
+        _ => return,
+    };
+
+    for token in tokens {
+        let Ok(interface) = std::str::from_utf8(token) else {
+            continue;
+        };
+        if interface.is_empty()
+            || interface.starts_with('-')
+            || interface.contains('/')
+            || interface.contains('=')
+            || interface.parse::<IpAddr>().is_ok()
+        {
+            continue;
+        }
+        if ipv4 {
+            evidence.ipv4_interfaces.insert(interface.to_string());
+        }
+        if ipv6 {
+            evidence.ipv6_interfaces.insert(interface.to_string());
+        }
+    }
+}
+
+fn collect_linux_dhcp_process_evidence(evidence: &mut LinuxDhcpEvidence) {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        if file_name.to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let path = entry.path().join("cmdline");
+        if let Ok(content) = std::fs::read(path) {
+            add_linux_dhcp_process_evidence(&content, evidence);
+        }
+    }
+}
+
 fn collect_linux_dhcp_evidence() -> HashMap<String, LinuxDhcpEvidence> {
     let mut evidence = HashMap::new();
     if let Ok(entries) = std::fs::read_dir("/run/systemd/netif/leases") {
@@ -267,6 +327,22 @@ fn collect_linux_dhcp_evidence() -> HashMap<String, LinuxDhcpEvidence> {
     if let Ok(entries) = std::fs::read_dir("/var/lib/dhcpcd") {
         for entry in entries.flatten() {
             add_linux_lease_evidence(&entry.path(), &mut evidence);
+        }
+    }
+
+    let mut process_evidence = LinuxDhcpEvidence::default();
+    collect_linux_dhcp_process_evidence(&mut process_evidence);
+    for interface in process_evidence
+        .ipv4_interfaces
+        .iter()
+        .chain(process_evidence.ipv6_interfaces.iter())
+    {
+        let entry = evidence.entry(interface.clone()).or_default();
+        if process_evidence.ipv4_interfaces.contains(interface) {
+            entry.ipv4_interfaces.insert(interface.clone());
+        }
+        if process_evidence.ipv6_interfaces.contains(interface) {
+            entry.ipv6_interfaces.insert(interface.clone());
         }
     }
     evidence
@@ -306,6 +382,9 @@ fn linux_ipv6_allocation(
         return IpAllocation::Other;
     }
     if evidence.is_some_and(|value| value.ipv6_addresses.contains(&address)) {
+        return IpAllocation::Dhcpv6;
+    }
+    if evidence.is_some_and(|value| value.ipv6_interfaces.contains(interface)) {
         return IpAllocation::Dhcpv6;
     }
 
@@ -519,6 +598,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                 } else if dhcp_evidence
                     .get(&ifa_name)
                     .is_some_and(|value| value.ipv4_addresses.contains(&ip))
+                    || dhcp_evidence
+                        .get(&ifa_name)
+                        .is_some_and(|value| value.ipv4_interfaces.contains(&ifa_name))
                 {
                     IpAllocation::Dhcpv4
                 } else {
@@ -802,6 +884,15 @@ mod tests {
 
         assert!(ipv4.contains(&Ipv4Addr::new(192, 0, 2, 10)));
         assert!(ipv6.contains(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10)));
+    }
+
+    #[test]
+    fn parses_dhcp_process_interface_snapshot_once() {
+        let mut evidence = LinuxDhcpEvidence::default();
+        add_linux_dhcp_process_evidence(b"/sbin/dhcpcd\0-q\0eth0\0", &mut evidence);
+
+        assert!(evidence.ipv4_interfaces.contains("eth0"));
+        assert!(evidence.ipv6_interfaces.contains("eth0"));
     }
 
     #[test]
