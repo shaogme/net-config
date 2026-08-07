@@ -38,8 +38,10 @@ pub fn current() -> Language {
 pub enum Text {
     ProgramTitle,
     UnknownArg,
+    UnsupportedLanguage,
     JsonError,
     FetchInterfaceError,
+    OutputError,
     PrimaryInterfaceHeader,
     NoPrimaryInterface,
     OtherInterfaceHeader,
@@ -93,8 +95,10 @@ impl Text {
             Language::Zh => match self {
                 Text::ProgramTitle => "NetConfig - 跨平台网络接口拓扑分析工具",
                 Text::UnknownArg => "错误: 未知的命令行参数",
+                Text::UnsupportedLanguage => "错误：不支持的语言",
                 Text::JsonError => "错误：序列化 JSON 失败",
                 Text::FetchInterfaceError => "错误：获取网卡信息失败",
+                Text::OutputError => "错误：输出失败",
                 Text::PrimaryInterfaceHeader => "主网卡 (Primary Interface)",
                 Text::NoPrimaryInterface => "  (未检测到主网卡，可能无互联网连接)",
                 Text::OtherInterfaceHeader => "其他网卡 (Other Interfaces)",
@@ -143,8 +147,10 @@ impl Text {
             Language::En => match self {
                 Text::ProgramTitle => "NetConfig - Cross-Platform Network Interface Topology Tool",
                 Text::UnknownArg => "Error: Unknown command-line argument",
+                Text::UnsupportedLanguage => "Error: Unsupported language",
                 Text::JsonError => "Error: Failed to serialize JSON",
                 Text::FetchInterfaceError => "Error: Failed to get network interfaces",
+                Text::OutputError => "Error: Failed to write output",
                 Text::PrimaryInterfaceHeader => "Primary Interface",
                 Text::NoPrimaryInterface => {
                     "  (No primary interface detected, possibly no internet connection)"

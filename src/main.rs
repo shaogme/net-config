@@ -2,7 +2,82 @@ mod i18n;
 mod os;
 mod shared;
 
+use std::fmt;
+use std::io::{self, Write};
+
+#[derive(Debug)]
+enum AppError {
+    UnknownArgument(String),
+    UnsupportedLanguage(String),
+    Network(shared::NetworkError),
+    Json(serde_json::Error),
+    Output(io::Error),
+}
+
+impl From<shared::NetworkError> for AppError {
+    fn from(error: shared::NetworkError) -> Self {
+        Self::Network(error)
+    }
+}
+
+impl From<serde_json::Error> for AppError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+impl From<io::Error> for AppError {
+    fn from(error: io::Error) -> Self {
+        Self::Output(error)
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownArgument(argument) => {
+                write!(formatter, "{}: {}", t!(UnknownArg), argument)
+            }
+            Self::UnsupportedLanguage(language) => write!(
+                formatter,
+                "{} '{}'. Supported values: 'zh', 'en'.",
+                t!(UnsupportedLanguage),
+                language
+            ),
+            Self::Network(error) => {
+                write!(
+                    formatter,
+                    "{} [{}]: {}",
+                    t!(FetchInterfaceError),
+                    error.code(),
+                    error
+                )
+            }
+            Self::Json(error) => write!(formatter, "{}: {}", t!(JsonError), error),
+            Self::Output(error) => write!(formatter, "{}: {}", t!(OutputError), error),
+        }
+    }
+}
+
+impl std::error::Error for AppError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Network(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::Output(error) => Some(error),
+            Self::UnknownArgument(_) | Self::UnsupportedLanguage(_) => None,
+        }
+    }
+}
+
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("{}", error);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut show_all = false;
@@ -48,172 +123,213 @@ fn main() {
         if let Some(lang) = i18n::Language::from_str(lang_str) {
             i18n::init(lang);
         } else {
-            eprintln!(
-                "Error: Unsupported language '{}'. Supported values: 'zh', 'en'.",
-                lang_str
-            );
-            std::process::exit(1);
+            return Err(AppError::UnsupportedLanguage(lang_str.clone()));
         }
     }
 
     if show_help {
-        print_help(&args[0]);
-        return;
+        print_help(&args[0])?;
+        return Ok(());
     }
 
     if let Some(arg) = unknown_arg {
-        eprintln!("{}: {}", t!(UnknownArg), arg);
-        print_help(&args[0]);
-        std::process::exit(1);
+        print_help(&args[0])?;
+        return Err(AppError::UnknownArgument(arg));
+    }
+
+    let mut interfaces = shared::get_network_interfaces()?;
+    if !show_all {
+        interfaces.other.clear();
     }
 
     if json_output {
-        match shared::get_network_interfaces() {
-            Ok(mut interfaces) => {
-                if !show_all {
-                    interfaces.other.clear();
-                }
-                match serde_json::to_string_pretty(&interfaces) {
-                    Ok(json) => println!("{}", json),
-                    Err(e) => {
-                        eprintln!("{}: {}", t!(JsonError), e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("{}: {}", t!(FetchInterfaceError), e);
-                std::process::exit(1);
-            }
-        }
-        return;
+        render_json(&interfaces)?;
+    } else {
+        render_text(&interfaces, show_all)?;
     }
 
-    println!("==================================================================");
-    println!(" {}", t!(ProgramTitle));
-    println!("==================================================================");
-
-    match shared::get_network_interfaces() {
-        Ok(interfaces) => {
-            println!("\n[{}]", t!(PrimaryInterfaceHeader));
-            if let Some(ref face) = interfaces.primary {
-                print_interface(face);
-            } else {
-                println!("{}", t!(NoPrimaryInterface));
-            }
-
-            if show_all {
-                println!("\n[{}]", t!(OtherInterfaceHeader));
-                if interfaces.other.is_empty() {
-                    println!("{}", t!(NoOtherInterface));
-                } else {
-                    for face in &interfaces.other {
-                        print_interface(face);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("{}: {}", t!(FetchInterfaceError), e);
-        }
-    }
-    println!("\n==================================================================");
+    Ok(())
 }
 
-fn print_help(program_name: &str) {
+fn print_help(program_name: &str) -> Result<(), AppError> {
     let path = std::path::Path::new(program_name);
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(program_name);
 
-    print!("{}", t!(UsageTitle));
-    println!("{}", t!(Usage));
-    println!("  {} [options]\n", name);
-    println!("{}", t!(OptionsHeader));
-    println!("{}", t!(OptAll));
-    println!("{}", t!(OptJson));
-    println!("{}", t!(OptHelp));
-    println!("{}", t!(OptLang));
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write!(output, "{}", t!(UsageTitle))?;
+    writeln!(output, "{}", t!(Usage))?;
+    writeln!(output, "  {} [options]\n", name)?;
+    writeln!(output, "{}", t!(OptionsHeader))?;
+    writeln!(output, "{}", t!(OptAll))?;
+    writeln!(output, "{}", t!(OptJson))?;
+    writeln!(output, "{}", t!(OptHelp))?;
+    writeln!(output, "{}", t!(OptLang))?;
+    output.flush()?;
+    Ok(())
 }
 
-fn print_interface(face: &shared::NetworkInterface) {
-    println!("--------------------------------------------------");
-    println!(" {}: {}", t!(IfaceName, 14), face.name);
-    println!(" {}: {}", t!(IfaceDescription, 14), face.description);
+fn render_json(interfaces: &shared::NetworkInterfaces) -> Result<(), AppError> {
+    let json = serde_json::to_string_pretty(interfaces)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "{}", json)?;
+    output.flush()?;
+    Ok(())
+}
+
+fn render_text(interfaces: &shared::NetworkInterfaces, show_all: bool) -> Result<(), AppError> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+
+    writeln!(
+        output,
+        "=================================================================="
+    )?;
+    writeln!(output, " {}", t!(ProgramTitle))?;
+    writeln!(
+        output,
+        "=================================================================="
+    )?;
+    writeln!(output, "\n[{}]", t!(PrimaryInterfaceHeader))?;
+    if let Some(ref face) = interfaces.primary {
+        print_interface(face, &mut output)?;
+    } else {
+        writeln!(output, "{}", t!(NoPrimaryInterface))?;
+    }
+
+    if show_all {
+        writeln!(output, "\n[{}]", t!(OtherInterfaceHeader))?;
+        if interfaces.other.is_empty() {
+            writeln!(output, "{}", t!(NoOtherInterface))?;
+        } else {
+            for face in &interfaces.other {
+                print_interface(face, &mut output)?;
+            }
+        }
+    }
+
+    writeln!(
+        output,
+        "\n=================================================================="
+    )?;
+    output.flush()?;
+    Ok(())
+}
+
+fn print_interface<W: Write>(face: &shared::NetworkInterface, output: &mut W) -> io::Result<()> {
+    writeln!(output, "--------------------------------------------------")?;
+    writeln!(output, " {}: {}", t!(IfaceName, 14), face.name)?;
+    writeln!(
+        output,
+        " {}: {}",
+        t!(IfaceDescription, 14),
+        face.description
+    )?;
 
     // 1. 状态与指示灯
-    println!(
+    writeln!(
+        output,
         " {}: {}",
         t!(IfaceStatus, 14),
         i18n::localize_status(face.status)
-    );
+    )?;
 
     // 2. 接口类型
-    println!(
+    writeln!(
+        output,
         " {}: {}",
         t!(IfaceType, 14),
         i18n::localize_type(face.interface_type)
-    );
+    )?;
 
     // 3. IP/协议栈分配方式
-    println!(
+    writeln!(
+        output,
         " {}: {}",
         t!(IfaceAllocation, 14),
         i18n::localize_allocation(face.allocation)
-    );
+    )?;
 
     // 4. 链路速度
     if let Some(speed) = face.link_speed {
-        println!(" {}: {}", t!(IfaceSpeed, 14), format_link_speed(speed));
+        writeln!(
+            output,
+            " {}: {}",
+            t!(IfaceSpeed, 14),
+            format_link_speed(speed)
+        )?;
     } else {
-        println!(" {}: {}", t!(IfaceSpeed, 14), t!(SpeedUnknown));
+        writeln!(output, " {}: {}", t!(IfaceSpeed, 14), t!(SpeedUnknown))?;
     }
 
     // 5. MAC 地址
     if let Some(ref mac) = face.mac_address {
-        println!(" {}: {}", t!(IfaceMac, 14), mac);
+        writeln!(output, " {}: {}", t!(IfaceMac, 14), mac)?;
     } else {
-        println!(" {}: {}", t!(IfaceMac, 14), t!(MacUnknown));
+        writeln!(output, " {}: {}", t!(IfaceMac, 14), t!(MacUnknown))?;
     }
 
     // 6. IPv4 地址配置
     if !face.ipv4_addresses.is_empty() {
-        println!(" {}:", t!(Ipv4Config));
+        writeln!(output, " {}:", t!(Ipv4Config))?;
         for (i, ipv4) in face.ipv4_addresses.iter().enumerate() {
-            println!("   [{}] {}: {}", i + 1, t!(Ipv4AddrLabel, 11), ipv4.address);
-            println!(
+            writeln!(
+                output,
+                "   [{}] {}: {}",
+                i + 1,
+                t!(Ipv4AddrLabel, 11),
+                ipv4.address
+            )?;
+            writeln!(
+                output,
                 "       {}: {} ({} /{})",
                 t!(Ipv4MaskLabel, 11),
                 ipv4.netmask,
                 t!(Ipv4PrefixSuffix),
                 ipv4.prefix_len
-            );
-            println!(
+            )?;
+            writeln!(
+                output,
                 "       {}: {}",
                 t!(Ipv4AllocLabel, 11),
                 i18n::localize_allocation(ipv4.allocation)
-            );
+            )?;
         }
     }
 
     // 7. IPv6 地址配置
     if !face.ipv6_addresses.is_empty() {
-        println!(" {}:", t!(Ipv6Config));
+        writeln!(output, " {}:", t!(Ipv6Config))?;
         for (i, ipv6) in face.ipv6_addresses.iter().enumerate() {
-            println!("   [{}] {}: {}", i + 1, t!(Ipv6AddrLabel, 11), ipv6.address);
-            println!("       {}: /{}", t!(Ipv6PrefixLabel, 11), ipv6.prefix_len);
-            println!(
+            writeln!(
+                output,
+                "   [{}] {}: {}",
+                i + 1,
+                t!(Ipv6AddrLabel, 11),
+                ipv6.address
+            )?;
+            writeln!(
+                output,
+                "       {}: /{}",
+                t!(Ipv6PrefixLabel, 11),
+                ipv6.prefix_len
+            )?;
+            writeln!(
+                output,
                 "       {}: {}",
                 t!(Ipv6AllocLabel, 11),
                 i18n::localize_allocation(ipv6.allocation)
-            );
+            )?;
         }
     }
 
     // 8. 路由配置
     if !face.routes.is_empty() {
-        println!(" {}:", t!(Routes));
+        writeln!(output, " {}:", t!(Routes))?;
         for (i, route) in face.routes.iter().enumerate() {
             let destination = if route.is_default {
                 t!(RouteDefault).to_string()
@@ -232,21 +348,27 @@ fn print_interface(face: &shared::NetworkInterface) {
                 |value| value.to_string(),
             );
 
-            println!(
+            writeln!(
+                output,
                 "   [{}] {}: {}",
                 i + 1,
                 t!(RouteDestination, 11),
                 destination
-            );
-            println!("       {}: {}", t!(RouteGateway, 11), gateway);
-            println!("       {}: {}", t!(RouteInterface, 11), route.interface);
-            println!("       {}: {}", t!(RouteMetric, 11), metric);
+            )?;
+            writeln!(output, "       {}: {}", t!(RouteGateway, 11), gateway)?;
+            writeln!(
+                output,
+                "       {}: {}",
+                t!(RouteInterface, 11),
+                route.interface
+            )?;
+            writeln!(output, "       {}: {}", t!(RouteMetric, 11), metric)?;
         }
     }
 
     // 9. DNS 服务器配置 (采用树状结构)
     if !face.dns_servers.is_empty() {
-        println!(" {}:", t!(DnsServers));
+        writeln!(output, " {}:", t!(DnsServers))?;
         let len = face.dns_servers.len();
         for (i, dns) in face.dns_servers.iter().enumerate() {
             let is_last = i == len - 1;
@@ -255,28 +377,32 @@ fn print_interface(face: &shared::NetworkInterface) {
             } else {
                 "   ├──"
             };
-            println!("{} {}", prefix, dns);
+            writeln!(output, "{} {}", prefix, dns)?;
         }
     }
 
     // 10. 网络吞吐流量统计 (采用树状结构)
     if let Some(ref stats) = face.statistics {
-        println!(" {}:", t!(Statistics));
-        println!(
+        writeln!(output, " {}:", t!(Statistics))?;
+        writeln!(
+            output,
             "   ├── {}: {} ({} {})",
             t!(RxStats, 16),
             format_bytes(stats.rx_bytes),
             stats.rx_packets,
             t!(Packets)
-        );
-        println!(
+        )?;
+        writeln!(
+            output,
             "   └── {}: {} ({} {})",
             t!(TxStats, 16),
             format_bytes(stats.tx_bytes),
             stats.tx_packets,
             t!(Packets)
-        );
+        )?;
     }
+
+    Ok(())
 }
 
 fn format_link_speed(bps: u64) -> String {

@@ -1,6 +1,6 @@
 use crate::shared::{
     AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkInterface, NetworkInterfaces, Route,
+    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -32,40 +32,48 @@ impl LinuxRouteV4 {
     }
 }
 
-fn parse_ipv4_route_line(line: &str) -> Option<LinuxRouteV4> {
+fn parse_ipv4_route_line(line: &str) -> Result<Option<LinuxRouteV4>, NetworkError> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 8 {
-        return None;
+        return Ok(None);
     }
 
-    let destination_raw = u32::from_str_radix(parts[1], 16).ok()?;
-    let gateway_raw = u32::from_str_radix(parts[2], 16).ok()?;
-    let metric = parts[6].parse::<u32>().ok()?;
-    let mask_raw = u32::from_str_radix(parts[7], 16).ok()?;
+    let destination_raw = u32::from_str_radix(parts[1], 16)
+        .map_err(|_| NetworkError::parse("Linux IPv4 route destination", parts[1]))?;
+    let gateway_raw = u32::from_str_radix(parts[2], 16)
+        .map_err(|_| NetworkError::parse("Linux IPv4 route gateway", parts[2]))?;
+    let metric = parts[6]
+        .parse::<u32>()
+        .map_err(|_| NetworkError::parse("Linux IPv4 route metric", parts[6]))?;
+    let mask_raw = u32::from_str_radix(parts[7], 16)
+        .map_err(|_| NetworkError::parse("Linux IPv4 route netmask", parts[7]))?;
     let destination = Ipv4Addr::from(destination_raw.to_ne_bytes());
     let gateway = Ipv4Addr::from(gateway_raw.to_ne_bytes());
 
-    Some(LinuxRouteV4 {
+    Ok(Some(LinuxRouteV4 {
         iface: parts[0].to_string(),
         destination,
         prefix_len: mask_raw.count_ones() as u8,
         gateway: (!gateway.is_unspecified()).then_some(gateway),
         metric,
         is_default: destination.is_unspecified() && mask_raw == 0,
-    })
+    }))
 }
 
-fn parse_ipv4_routes() -> Vec<LinuxRouteV4> {
+fn parse_ipv4_routes() -> Result<Vec<LinuxRouteV4>, NetworkError> {
+    const PATH: &str = "/proc/net/route";
     let mut routes = Vec::new();
-    if let Ok(file) = File::open("/proc/net/route") {
-        let reader = BufReader::new(file);
-        for line in reader.lines().skip(1).map_while(Result::ok) {
-            if let Some(route) = parse_ipv4_route_line(&line) {
-                routes.push(route);
-            }
+    let file = File::open(PATH)
+        .map_err(|source| NetworkError::io("read IPv4 route table", PATH, source))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().skip(1) {
+        let line =
+            line.map_err(|source| NetworkError::io("read IPv4 route table", PATH, source))?;
+        if let Some(route) = parse_ipv4_route_line(&line)? {
+            routes.push(route);
         }
     }
-    routes
+    Ok(routes)
 }
 
 struct LinuxRouteV6 {
@@ -97,67 +105,79 @@ impl LinuxRouteV6 {
     }
 }
 
-fn parse_hex_to_ipv6(hex_str: &str) -> Result<Ipv6Addr, String> {
+fn parse_hex_to_ipv6(hex_str: &str) -> Result<Ipv6Addr, NetworkError> {
     if hex_str.len() != 32 {
-        return Err("Invalid hex length for IPv6".to_string());
+        return Err(NetworkError::parse(
+            "Linux IPv6 hexadecimal address length",
+            hex_str,
+        ));
     }
     let mut bytes = [0u8; 16];
     for i in 0..16 {
         let byte_str = &hex_str[i * 2..i * 2 + 2];
-        bytes[i] = u8::from_str_radix(byte_str, 16).map_err(|e| e.to_string())?;
+        bytes[i] = u8::from_str_radix(byte_str, 16)
+            .map_err(|_| NetworkError::parse("Linux IPv6 hexadecimal address", byte_str))?;
     }
     Ok(Ipv6Addr::from(bytes))
 }
 
-fn parse_ipv6_route_line(line: &str) -> Option<LinuxRouteV6> {
+fn parse_ipv6_route_line(line: &str) -> Result<Option<LinuxRouteV6>, NetworkError> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 10 {
-        return None;
+        return Ok(None);
     }
 
-    let destination = parse_hex_to_ipv6(parts[0]).ok()?;
-    let prefix_len = u8::from_str_radix(parts[1], 16).ok()?;
+    let destination = parse_hex_to_ipv6(parts[0])?;
+    let prefix_len = u8::from_str_radix(parts[1], 16)
+        .map_err(|_| NetworkError::parse("Linux IPv6 route prefix length", parts[1]))?;
     if prefix_len > 128 {
-        return None;
+        return Err(NetworkError::parse(
+            "Linux IPv6 route prefix length",
+            parts[1],
+        ));
     }
-    let gateway = parse_hex_to_ipv6(parts[4]).ok()?;
-    let metric = u32::from_str_radix(parts[5], 16).ok()?;
+    let gateway = parse_hex_to_ipv6(parts[4])?;
+    let metric = u32::from_str_radix(parts[5], 16)
+        .map_err(|_| NetworkError::parse("Linux IPv6 route metric", parts[5]))?;
 
-    Some(LinuxRouteV6 {
+    Ok(Some(LinuxRouteV6 {
         iface: parts[9].to_string(),
         destination,
         prefix_len,
         gateway: (!gateway.is_unspecified()).then_some(gateway),
         metric,
         is_default: destination.is_unspecified() && prefix_len == 0,
-    })
+    }))
 }
 
-fn parse_ipv6_routes() -> Vec<LinuxRouteV6> {
+fn parse_ipv6_routes() -> Result<Vec<LinuxRouteV6>, NetworkError> {
+    const PATH: &str = "/proc/net/ipv6_route";
     let mut routes = Vec::new();
-    if let Ok(file) = File::open("/proc/net/ipv6_route") {
-        let reader = BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(route) = parse_ipv6_route_line(&line) {
-                routes.push(route);
-            }
+    let file = File::open(PATH)
+        .map_err(|source| NetworkError::io("read IPv6 route table", PATH, source))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line =
+            line.map_err(|source| NetworkError::io("read IPv6 route table", PATH, source))?;
+        if let Some(route) = parse_ipv6_route_line(&line)? {
+            routes.push(route);
         }
     }
-    routes
+    Ok(routes)
 }
 
 fn is_dhcp_interface_linux(iface: &str) -> bool {
     if iface == "lo" {
         return false;
     }
-    if std::path::Path::new("/run/systemd/netif/leases").exists() {
-        if let Ok(entries) = std::fs::read_dir("/run/systemd/netif/leases") {
-            for entry in entries.flatten() {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    if content.contains(&format!("INTERFACE={}", iface)) {
-                        return true;
-                    }
-                }
+    if std::path::Path::new("/run/systemd/netif/leases").exists()
+        && let Ok(entries) = std::fs::read_dir("/run/systemd/netif/leases")
+    {
+        for entry in entries.flatten() {
+            if let Ok(content) = std::fs::read_to_string(entry.path())
+                && content.contains(&format!("INTERFACE={}", iface))
+            {
+                return true;
             }
         }
     }
@@ -175,48 +195,48 @@ fn is_dhcp_interface_linux(iface: &str) -> bool {
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let pid_path = entry.path().join("cmdline");
-            if pid_path.exists() {
-                if let Ok(cmdline) = std::fs::read_to_string(pid_path) {
-                    if (cmdline.contains("dhclient")
-                        || cmdline.contains("dhcpcd")
-                        || cmdline.contains("udhcpc"))
-                        && cmdline.contains(iface)
-                    {
-                        return true;
-                    }
-                }
+            if pid_path.exists()
+                && let Ok(cmdline) = std::fs::read_to_string(pid_path)
+                && (cmdline.contains("dhclient")
+                    || cmdline.contains("dhcpcd")
+                    || cmdline.contains("udhcpc"))
+                && cmdline.contains(iface)
+            {
+                return true;
             }
         }
     }
     false
 }
 
-fn parse_ipv6_permanent_map() -> std::collections::HashMap<(String, Ipv6Addr), bool> {
+fn parse_ipv6_permanent_map()
+-> Result<std::collections::HashMap<(String, Ipv6Addr), bool>, NetworkError> {
+    const PATH: &str = "/proc/net/if_inet6";
     let mut map = std::collections::HashMap::new();
-    if let Ok(file) = File::open("/proc/net/if_inet6") {
-        let reader = BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 6 {
-                if let (Ok(ip), Ok(flags)) = (
-                    parse_hex_to_ipv6(parts[0]),
-                    u32::from_str_radix(parts[4], 16),
-                ) {
-                    let iface = parts[5].to_string();
-                    let is_permanent = (flags & 0x80) != 0;
-                    map.insert((iface, ip), is_permanent);
-                }
-            }
+    let file = File::open(PATH)
+        .map_err(|source| NetworkError::io("read IPv6 interface table", PATH, source))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line =
+            line.map_err(|source| NetworkError::io("read IPv6 interface table", PATH, source))?;
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 6 {
+            let ip = parse_hex_to_ipv6(parts[0])?;
+            let flags = u32::from_str_radix(parts[4], 16)
+                .map_err(|_| NetworkError::parse("Linux IPv6 interface flags", parts[4]))?;
+            let iface = parts[5].to_string();
+            let is_permanent = (flags & 0x80) != 0;
+            map.insert((iface, ip), is_permanent);
         }
     }
-    map
+    Ok(map)
 }
 
-pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
+pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取默认路由及网关列表
-    let v4_routes = parse_ipv4_routes();
-    let v6_routes = parse_ipv6_routes();
-    let v6_perm_map = parse_ipv6_permanent_map();
+    let v4_routes = parse_ipv4_routes()?;
+    let v6_routes = parse_ipv6_routes()?;
+    let v6_perm_map = parse_ipv6_permanent_map()?;
 
     // 找出 Metric 最小的默认路由作为主网卡接口；点对点默认路由可以没有网关。
     let primary_v4_iface = v4_routes
@@ -237,9 +257,11 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
     let res = unsafe { libc::getifaddrs(&mut ifap) };
     if res != 0 {
-        return Err("getifaddrs failed".to_string());
+        let code = std::io::Error::last_os_error()
+            .raw_os_error()
+            .map_or(0, |value| value as u32);
+        return Err(NetworkError::api("getifaddrs", code));
     }
-
     let mut interface_map: std::collections::HashMap<String, NetworkInterface> =
         std::collections::HashMap::new();
 
@@ -374,7 +396,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         current = ifa.ifa_next;
     }
 
-    unsafe { libc::freeifaddrs(ifap) };
+    if !ifap.is_null() {
+        unsafe { libc::freeifaddrs(ifap) };
+    }
 
     // 辅助函数：读取流量统计
     fn read_stat_file(iface: &str, file: &str) -> Option<u64> {
@@ -425,10 +449,10 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
             let mut arp_type = 0u32;
             if let Ok(mut file) = File::open(&type_path) {
                 let mut type_str = String::new();
-                if std::io::Read::read_to_string(&mut file, &mut type_str).is_ok() {
-                    if let Ok(val) = type_str.trim().parse::<u32>() {
-                        arp_type = val;
-                    }
+                if std::io::Read::read_to_string(&mut file, &mut type_str).is_ok()
+                    && let Ok(val) = type_str.trim().parse::<u32>()
+                {
+                    arp_type = val;
                 }
             }
 
@@ -481,12 +505,11 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         let speed_path = format!("/sys/class/net/{}/speed", name);
         if let Ok(mut file) = File::open(&speed_path) {
             let mut speed_str = String::new();
-            if std::io::Read::read_to_string(&mut file, &mut speed_str).is_ok() {
-                if let Ok(speed_val) = speed_str.trim().parse::<i64>() {
-                    if speed_val > 0 {
-                        interface.link_speed = Some((speed_val as u64) * 1_000_000);
-                    }
-                }
+            if std::io::Read::read_to_string(&mut file, &mut speed_str).is_ok()
+                && let Ok(speed_val) = speed_str.trim().parse::<i64>()
+                && speed_val > 0
+            {
+                interface.link_speed = Some((speed_val as u64) * 1_000_000);
             }
         }
 
@@ -544,7 +567,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     let mut other: Vec<NetworkInterface> = Vec::new();
 
     for iface in interface_map.into_values() {
-        let is_pri = primary_iface.as_ref().map_or(false, |p| p == &iface.name);
+        let is_pri = primary_iface.as_ref() == Some(&iface.name);
         if is_pri && primary.is_none() {
             primary = Some(iface);
         } else {
@@ -553,34 +576,36 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     }
 
     // 保底：若无主网卡，选择第一个非环回有IP绑定的网卡作为 primary
-    if primary.is_none() {
-        if let Some(pos) = other.iter().position(|i| {
+    if primary.is_none()
+        && let Some(pos) = other.iter().position(|i| {
             i.name != "lo" && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
-        }) {
-            primary = Some(other.remove(pos));
-        }
+        })
+    {
+        primary = Some(other.remove(pos));
     }
 
     // 7. 解析并分配全局 DNS 给主网卡
-    fn parse_dns_servers() -> Vec<IpAddr> {
+    fn parse_dns_servers() -> Result<Vec<IpAddr>, NetworkError> {
+        const PATH: &str = "/etc/resolv.conf";
         let mut dns = Vec::new();
-        if let Ok(file) = File::open("/etc/resolv.conf") {
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 && parts[0] == "nameserver" {
-                        if let Ok(ip) = parts[1].parse::<IpAddr>() {
-                            dns.push(ip);
-                        }
-                    }
-                }
+        let file = File::open(PATH)
+            .map_err(|source| NetworkError::io("read DNS configuration", PATH, source))?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line =
+                line.map_err(|source| NetworkError::io("read DNS configuration", PATH, source))?;
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts[0] == "nameserver" {
+                let ip = parts[1]
+                    .parse::<IpAddr>()
+                    .map_err(|_| NetworkError::parse("Linux DNS nameserver address", parts[1]))?;
+                dns.push(ip);
             }
         }
-        dns
+        Ok(dns)
     }
 
-    let dns_list = parse_dns_servers();
+    let dns_list = parse_dns_servers()?;
     if let Some(ref mut pri) = primary {
         pri.dns_servers = dns_list;
     }
@@ -595,6 +620,7 @@ mod tests {
     #[test]
     fn parses_ipv4_default_route_without_gateway() {
         let route = parse_ipv4_route_line("ppp0 00000000 00000000 0000 0 0 10 00000000 0 0 0")
+            .expect("route parsing should not fail")
             .expect("default route should parse");
 
         assert_eq!(route.destination, Ipv4Addr::UNSPECIFIED);
@@ -607,6 +633,7 @@ mod tests {
     #[test]
     fn parses_ipv4_network_and_gateway_separately() {
         let route = parse_ipv4_route_line("eth0 0000A8C0 0100A8C0 0003 0 0 100 0000FFFF 0 0 0")
+            .expect("route parsing should not fail")
             .expect("IPv4 route should parse");
 
         assert_eq!(route.destination, Ipv4Addr::new(192, 168, 0, 0));
@@ -620,6 +647,7 @@ mod tests {
         let route = parse_ipv6_route_line(
             "20010db8000000000000000000000000 40 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000010 00000000 00000000 00000001 eth0",
         )
+        .expect("route parsing should not fail")
         .expect("IPv6 route should parse");
 
         assert_eq!(

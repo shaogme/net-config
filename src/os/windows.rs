@@ -11,7 +11,7 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use crate::shared::{
     AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkInterface, NetworkInterfaces, Route,
+    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
 };
 use std::net::IpAddr;
 
@@ -78,14 +78,11 @@ fn normalize_gateway(address: IpAddr) -> Option<IpAddr> {
     (!address.is_unspecified()).then_some(address)
 }
 
-fn get_windows_routes() -> Result<Vec<WindowsRoute>, String> {
+fn get_windows_routes() -> Result<Vec<WindowsRoute>, NetworkError> {
     let mut table: *mut MIB_IPFORWARD_TABLE2 = ptr::null_mut();
     let result = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) };
     if result != ERROR_SUCCESS {
-        return Err(format!(
-            "GetIpForwardTable2 failed with error code {}",
-            result
-        ));
+        return Err(NetworkError::api("GetIpForwardTable2", result));
     }
     if table.is_null() {
         return Ok(Vec::new());
@@ -138,7 +135,7 @@ fn prefix_to_ipv4_mask(prefix: u8) -> Ipv4Addr {
     }
 }
 
-pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
+pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取主网卡接口索引 (GetBestInterface)
     let mut best_index = 0u32;
     // 传入 8.8.8.8 的大端表示 (0x08080808) 探测最优网络接口
@@ -178,10 +175,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     }
 
     if res != ERROR_SUCCESS {
-        return Err(format!(
-            "GetAdaptersAddresses failed with error code {}",
-            res
-        ));
+        return Err(NetworkError::api("GetAdaptersAddresses", res));
     }
 
     let mut primary: Option<NetworkInterface> = None;
@@ -198,7 +192,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 .to_string_lossy()
                 .into_owned()
         } else {
-            String::new()
+            return Err(NetworkError::invariant(
+                "GetAdaptersAddresses returned an adapter without AdapterName",
+            ));
         };
 
         // 提取适配器的友好描述名称
@@ -216,6 +212,12 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         // 提取 MAC 地址
         let mac_address = if adapter.PhysicalAddressLength > 0 {
             let len = adapter.PhysicalAddressLength as usize;
+            if len > adapter.PhysicalAddress.len() {
+                return Err(NetworkError::invariant(format!(
+                    "adapter {} reported a physical address length of {}",
+                    name, len
+                )));
+            }
             let mac_bytes = &adapter.PhysicalAddress[..len];
             let mac_str = mac_bytes
                 .iter()

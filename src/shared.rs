@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{fmt, io, path::PathBuf, process::ExitStatus};
 
 /// 物理/虚拟接口运行状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,13 +150,194 @@ pub struct Ipv6Info {
     pub allocation: IpAllocation,
 }
 
+/// 网络采集过程中的结构化错误。
+///
+/// 采集器保留故障阶段和平台上下文，CLI 只在最外层将其转换为用户可读文本。
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum NetworkError {
+    /// 原生系统 API 返回了失败码。
+    Api { operation: String, code: u32 },
+    /// 读取系统文件或其他 IO 资源失败。
+    Io {
+        operation: String,
+        path: PathBuf,
+        source: io::Error,
+    },
+    /// 外部命令无法启动或以失败状态退出。
+    Command {
+        command: String,
+        args: Vec<String>,
+        status: Option<i32>,
+        stderr: String,
+        source: Option<io::Error>,
+    },
+    /// 系统 API 或系统文件的内容不符合预期格式。
+    Parse { context: String, value: String },
+    /// 当前平台或运行环境不提供所需能力。
+    Unsupported { platform: String, feature: String },
+    /// 违反了采集器对系统 API 数据的内部假设。
+    Invariant { context: String },
+}
+
+#[allow(dead_code)]
+impl NetworkError {
+    pub fn api(operation: impl Into<String>, code: u32) -> Self {
+        Self::Api {
+            operation: operation.into(),
+            code,
+        }
+    }
+
+    pub fn io(operation: impl Into<String>, path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::Io {
+            operation: operation.into(),
+            path: path.into(),
+            source,
+        }
+    }
+
+    pub fn command_spawn(command: &str, args: &[&str], source: io::Error) -> Self {
+        Self::Command {
+            command: command.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            status: None,
+            stderr: String::new(),
+            source: Some(source),
+        }
+    }
+
+    pub fn command_failed(command: &str, args: &[&str], status: ExitStatus, stderr: &[u8]) -> Self {
+        Self::Command {
+            command: command.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            status: status.code(),
+            stderr: String::from_utf8_lossy(stderr).trim().to_string(),
+            source: None,
+        }
+    }
+
+    pub fn parse(context: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::Parse {
+            context: context.into(),
+            value: value.into(),
+        }
+    }
+
+    pub fn unsupported(platform: impl Into<String>, feature: impl Into<String>) -> Self {
+        Self::Unsupported {
+            platform: platform.into(),
+            feature: feature.into(),
+        }
+    }
+
+    pub fn invariant(context: impl Into<String>) -> Self {
+        Self::Invariant {
+            context: context.into(),
+        }
+    }
+
+    /// 稳定的机器可识别错误类别。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Api { .. } => "api",
+            Self::Io { .. } => "io",
+            Self::Command { .. } => "command",
+            Self::Parse { .. } => "parse",
+            Self::Unsupported { .. } => "unsupported",
+            Self::Invariant { .. } => "invariant",
+        }
+    }
+}
+
+impl fmt::Display for NetworkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Api { operation, code } => {
+                write!(formatter, "{} failed with error code {}", operation, code)
+            }
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "{} failed for {}: {}",
+                operation,
+                path.display(),
+                source
+            ),
+            Self::Command {
+                command,
+                args,
+                status,
+                stderr,
+                source,
+            } => {
+                let command_line = if args.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{} {}", command, args.join(" "))
+                };
+                if let Some(source) = source {
+                    write!(formatter, "failed to run {}: {}", command_line, source)
+                } else if let Some(status) = status {
+                    if stderr.is_empty() {
+                        write!(
+                            formatter,
+                            "command {} exited with status {}",
+                            command_line, status
+                        )
+                    } else {
+                        write!(
+                            formatter,
+                            "command {} exited with status {}: {}",
+                            command_line, status, stderr
+                        )
+                    }
+                } else {
+                    write!(formatter, "command {} failed", command_line)
+                }
+            }
+            Self::Parse { context, value } => {
+                write!(formatter, "failed to parse {}: {:?}", context, value)
+            }
+            Self::Unsupported { platform, feature } => {
+                write!(formatter, "{} is unsupported on {}", feature, platform)
+            }
+            Self::Invariant { context } => {
+                write!(formatter, "internal invariant failed: {}", context)
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetworkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Command {
+                source: Some(source),
+                ..
+            } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 /// 跨平台获取所有网卡信息的统一 API
-pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
-    std::cfg_select! {
-        target_os = "windows" => crate::os::get_network_interfaces(),
-        target_os = "linux" => crate::os::get_network_interfaces(),
-        target_os = "macos" => crate::os::get_network_interfaces(),
-        _ => compile_error!("Unsupported operating system")
+pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    {
+        crate::os::get_network_interfaces()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        Err(NetworkError::unsupported(
+            std::env::consts::OS,
+            "network interface collection",
+        ))
     }
 }
 
@@ -199,5 +381,25 @@ mod tests {
             let json_res = serde_json::to_string(&interfaces);
             assert!(json_res.is_ok(), "序列化网络接口数据失败");
         }
+    }
+
+    #[test]
+    fn network_error_keeps_category_and_context() {
+        let error = NetworkError::io(
+            "read route table",
+            "/proc/net/route",
+            io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
+        );
+
+        assert_eq!(error.code(), "io");
+        assert!(error.to_string().contains("/proc/net/route"));
+        assert!(error.to_string().contains("permission denied"));
+
+        let error = NetworkError::parse("IPv6 route prefix", "129");
+        assert_eq!(error.code(), "parse");
+        assert!(error.to_string().contains("IPv6 route prefix"));
+
+        let error = NetworkError::unsupported("test", "network interface collection");
+        assert_eq!(error.code(), "unsupported");
     }
 }

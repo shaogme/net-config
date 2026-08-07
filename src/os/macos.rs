@@ -1,28 +1,27 @@
 use crate::shared::{
     AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkInterface, NetworkInterfaces, Route,
+    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
 
-fn check_is_dhcp_macos(iface: &str) -> bool {
+fn check_is_dhcp_macos(iface: &str) -> Result<bool, NetworkError> {
     if iface.starts_with("lo") {
-        return false;
+        return Ok(false);
     }
-    if let Ok(output) = std::process::Command::new("ipconfig")
+    let output = std::process::Command::new("ipconfig")
         .args(["getpacket", iface])
         .output()
-    {
-        if output.status.success() && !output.stdout.is_empty() {
-            let s = String::from_utf8_lossy(&output.stdout);
-            if s.contains("op =") || s.contains("yiaddr") || s.contains("server_identifier") {
-                return true;
-            }
+        .map_err(|source| NetworkError::command_spawn("ipconfig", &["getpacket", iface], source))?;
+    if output.status.success() && !output.stdout.is_empty() {
+        let s = String::from_utf8_lossy(&output.stdout);
+        if s.contains("op =") || s.contains("yiaddr") || s.contains("server_identifier") {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn parse_ipv4_destination(value: &str, flags: &str) -> Option<(Ipv4Addr, u8)> {
@@ -71,6 +70,14 @@ fn parse_scoped_ipv6(value: &str) -> Option<(Ipv6Addr, Option<String>)> {
     Some((address, scope))
 }
 
+fn is_link_layer_address(value: &str) -> bool {
+    let octets: Vec<&str> = value.split(':').collect();
+    octets.len() == 6
+        && octets
+            .iter()
+            .all(|octet| (1..=2).contains(&octet.len()) && u8::from_str_radix(octet, 16).is_ok())
+}
+
 fn parse_ipv6_destination(value: &str, _flags: &str) -> Option<(Ipv6Addr, u8, Option<String>)> {
     if value == "default" {
         return Some((Ipv6Addr::UNSPECIFIED, 0, None));
@@ -88,34 +95,43 @@ fn parse_ipv6_destination(value: &str, _flags: &str) -> Option<(Ipv6Addr, u8, Op
     Some((address, prefix_len.unwrap_or(128), scope))
 }
 
-fn parse_macos_route_line(line: &str, family: AddressFamily) -> Option<Route> {
+fn parse_macos_route_line(
+    line: &str,
+    family: AddressFamily,
+) -> Result<Option<Route>, NetworkError> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 4 {
-        return None;
+    if parts.len() < 4 || parts[0] == "Destination" {
+        return Ok(None);
     }
 
     let flags = parts[2];
     let interface = parts[3];
     let (destination, prefix_len, destination_scope) = match family {
         AddressFamily::Ipv4 => {
-            let (address, prefix_len) = parse_ipv4_destination(parts[0], flags)?;
+            let (address, prefix_len) = parse_ipv4_destination(parts[0], flags)
+                .ok_or_else(|| NetworkError::parse("macOS IPv4 route destination", parts[0]))?;
             (IpAddr::V4(address), prefix_len, None)
         }
         AddressFamily::Ipv6 => {
-            let (address, prefix_len, scope) = parse_ipv6_destination(parts[0], flags)?;
+            let (address, prefix_len, scope) = parse_ipv6_destination(parts[0], flags)
+                .ok_or_else(|| NetworkError::parse("macOS IPv6 route destination", parts[0]))?;
             (IpAddr::V6(address), prefix_len, scope)
         }
     };
 
     let (gateway, gateway_scope) = match family {
-        AddressFamily::Ipv4 => (
-            parts[1]
-                .parse::<Ipv4Addr>()
-                .ok()
-                .filter(|address| !address.is_unspecified())
-                .map(IpAddr::V4),
-            None,
-        ),
+        AddressFamily::Ipv4 => match parts[1].parse::<Ipv4Addr>() {
+            Ok(address) => (
+                (!address.is_unspecified()).then_some(IpAddr::V4(address)),
+                None,
+            ),
+            Err(_) if parts[1].starts_with("link#") || is_link_layer_address(parts[1]) => {
+                (None, None)
+            }
+            Err(_) => {
+                return Err(NetworkError::parse("macOS IPv4 route gateway", parts[1]));
+            }
+        },
         AddressFamily::Ipv6 => match parse_scoped_ipv6(parts[1]) {
             Some((address, scope)) if !address.is_unspecified() => {
                 let scope = scope.or(destination_scope).or_else(|| {
@@ -125,11 +141,17 @@ fn parse_macos_route_line(line: &str, family: AddressFamily) -> Option<Route> {
                 });
                 (Some(IpAddr::V6(address)), scope)
             }
-            _ => (None, None),
+            Some(_) => (None, None),
+            None if parts[1].starts_with("link#") || is_link_layer_address(parts[1]) => {
+                (None, None)
+            }
+            None => {
+                return Err(NetworkError::parse("macOS IPv6 route gateway", parts[1]));
+            }
         },
     };
 
-    Some(Route {
+    Ok(Some(Route {
         family,
         destination,
         prefix_len,
@@ -138,36 +160,49 @@ fn parse_macos_route_line(line: &str, family: AddressFamily) -> Option<Route> {
         interface: interface.to_string(),
         metric: None,
         is_default: destination.is_unspecified() && prefix_len == 0,
-    })
+    }))
 }
 
-fn parse_macos_route_table(output: &str, family: AddressFamily) -> Vec<Route> {
-    output
-        .lines()
-        .filter_map(|line| parse_macos_route_line(line, family))
-        .collect()
-}
-
-fn get_macos_route_table(family_name: &str, family: AddressFamily) -> Vec<Route> {
-    let output = std::process::Command::new("netstat")
-        .args(["-rn", "-f", family_name])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            parse_macos_route_table(&String::from_utf8_lossy(&output.stdout), family)
+fn parse_macos_route_table(
+    output: &str,
+    family: AddressFamily,
+) -> Result<Vec<Route>, NetworkError> {
+    let mut routes = Vec::new();
+    for line in output.lines() {
+        if let Some(route) = parse_macos_route_line(line, family)? {
+            routes.push(route);
         }
-        _ => Vec::new(),
     }
+    Ok(routes)
+}
+
+fn get_macos_route_table(
+    family_name: &str,
+    family: AddressFamily,
+) -> Result<Vec<Route>, NetworkError> {
+    let args = ["-rn", "-f", family_name];
+    let output = std::process::Command::new("netstat").args(args).output();
+    let output = output.map_err(|source| NetworkError::command_spawn("netstat", &args, source))?;
+    if !output.status.success() {
+        return Err(NetworkError::command_failed(
+            "netstat",
+            &args,
+            output.status,
+            &output.stderr,
+        ));
+    }
+    parse_macos_route_table(&String::from_utf8_lossy(&output.stdout), family)
 }
 
 /// 解析 IPv4 默认路由 (执行 route get default)
-fn get_macos_default_route_v4() -> Option<Route> {
+fn get_macos_default_route_v4() -> Result<Option<Route>, NetworkError> {
+    let args = ["get", "default"];
     let output = std::process::Command::new("route")
-        .args(["get", "default"])
+        .args(args)
         .output()
-        .ok()?;
+        .map_err(|source| NetworkError::command_spawn("route", &args, source))?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let s = String::from_utf8_lossy(&output.stdout);
     let mut interface = None;
@@ -178,14 +213,16 @@ fn get_macos_default_route_v4() -> Option<Route> {
             if parts[0] == "interface:" {
                 interface = Some(parts[1].to_string());
             } else if parts[0] == "gateway:" {
-                if let Ok(ip) = parts[1].parse::<Ipv4Addr>() {
-                    gateway = Some(ip);
-                }
+                let ip = parts[1].parse::<Ipv4Addr>().map_err(|_| {
+                    NetworkError::parse("macOS IPv4 default route gateway", parts[1])
+                })?;
+                gateway = Some(ip);
             }
         }
     }
-    let interface = interface?;
-    Some(Route {
+    let interface = interface
+        .ok_or_else(|| NetworkError::parse("macOS IPv4 default route interface", s.trim()))?;
+    Ok(Some(Route {
         family: AddressFamily::Ipv4,
         destination: Ipv4Addr::UNSPECIFIED.into(),
         prefix_len: 0,
@@ -196,17 +233,18 @@ fn get_macos_default_route_v4() -> Option<Route> {
         interface,
         metric: None,
         is_default: true,
-    })
+    }))
 }
 
 /// 解析 IPv6 默认路由 (执行 route get -inet6 default)
-fn get_macos_default_route_v6() -> Option<Route> {
+fn get_macos_default_route_v6() -> Result<Option<Route>, NetworkError> {
+    let args = ["get", "-inet6", "default"];
     let output = std::process::Command::new("route")
-        .args(["get", "-inet6", "default"])
+        .args(args)
         .output()
-        .ok()?;
+        .map_err(|source| NetworkError::command_spawn("route", &args, source))?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let s = String::from_utf8_lossy(&output.stdout);
     let mut interface = None;
@@ -217,14 +255,16 @@ fn get_macos_default_route_v6() -> Option<Route> {
             if parts[0] == "interface:" {
                 interface = Some(parts[1].to_string());
             } else if parts[0] == "gateway:" {
-                if let Some((ip, scope)) = parse_scoped_ipv6(parts[1]) {
-                    gateway = Some((ip, scope));
-                }
+                let parsed = parse_scoped_ipv6(parts[1]).ok_or_else(|| {
+                    NetworkError::parse("macOS IPv6 default route gateway", parts[1])
+                })?;
+                gateway = Some(parsed);
             }
         }
     }
-    let interface = interface?;
-    let (gateway, explicit_scope) = gateway?;
+    let interface = interface
+        .ok_or_else(|| NetworkError::parse("macOS IPv6 default route interface", s.trim()))?;
+    let (gateway, explicit_scope) = gateway.unwrap_or((Ipv6Addr::UNSPECIFIED, None));
     let gateway = (!gateway.is_unspecified()).then_some(IpAddr::V6(gateway));
     let gateway_scope = explicit_scope.or_else(|| {
         gateway.and_then(|address| match address {
@@ -232,7 +272,7 @@ fn get_macos_default_route_v6() -> Option<Route> {
             _ => None,
         })
     });
-    Some(Route {
+    Ok(Some(Route {
         family: AddressFamily::Ipv6,
         destination: Ipv6Addr::UNSPECIFIED.into(),
         prefix_len: 0,
@@ -241,80 +281,89 @@ fn get_macos_default_route_v6() -> Option<Route> {
         interface,
         metric: None,
         is_default: true,
-    })
+    }))
 }
 
 /// 解析物理端口设备映射 (执行 networksetup -listallhardwareports)
-fn get_macos_interface_types() -> std::collections::HashMap<String, InterfaceType> {
+fn get_macos_interface_types()
+-> Result<std::collections::HashMap<String, InterfaceType>, NetworkError> {
     let mut types = std::collections::HashMap::new();
-    if let Ok(output) = std::process::Command::new("networksetup")
+    let args = ["-listallhardwareports"];
+    let output = std::process::Command::new("networksetup")
         .args(["-listallhardwareports"])
         .output()
-    {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout);
-            let mut current_port = String::new();
-            for line in s.lines() {
-                let line = line.trim();
-                if line.starts_with("Hardware Port:") {
-                    current_port = line.trim_start_matches("Hardware Port:").trim().to_string();
-                } else if line.starts_with("Device:") {
-                    let device = line.trim_start_matches("Device:").trim().to_string();
-                    if !device.is_empty() && !current_port.is_empty() {
-                        let itype = if current_port.contains("Wi-Fi") {
-                            InterfaceType::WiFi
-                        } else if current_port.contains("Ethernet")
-                            || current_port.contains("Thunderbolt")
-                        {
-                            InterfaceType::Ethernet
-                        } else if current_port.contains("Bridge") {
-                            InterfaceType::Virtual
-                        } else {
-                            InterfaceType::Other
-                        };
-                        types.insert(device, itype);
-                    }
-                }
+        .map_err(|source| NetworkError::command_spawn("networksetup", &args, source))?;
+    if !output.status.success() {
+        return Err(NetworkError::command_failed(
+            "networksetup",
+            &args,
+            output.status,
+            &output.stderr,
+        ));
+    }
+
+    let s = String::from_utf8_lossy(&output.stdout);
+    let mut current_port = String::new();
+    for line in s.lines() {
+        let line = line.trim();
+        if line.starts_with("Hardware Port:") {
+            current_port = line.trim_start_matches("Hardware Port:").trim().to_string();
+        } else if line.starts_with("Device:") {
+            let device = line.trim_start_matches("Device:").trim().to_string();
+            if !device.is_empty() && !current_port.is_empty() {
+                let itype = if current_port.contains("Wi-Fi") {
+                    InterfaceType::WiFi
+                } else if current_port.contains("Ethernet") || current_port.contains("Thunderbolt")
+                {
+                    InterfaceType::Ethernet
+                } else if current_port.contains("Bridge") {
+                    InterfaceType::Virtual
+                } else {
+                    InterfaceType::Other
+                };
+                types.insert(device, itype);
             }
         }
     }
-    types
+    Ok(types)
 }
 
 /// 解析全局 DNS 配置
-fn parse_dns_servers() -> Vec<IpAddr> {
+fn parse_dns_servers() -> Result<Vec<IpAddr>, NetworkError> {
+    const PATH: &str = "/etc/resolv.conf";
     let mut dns = Vec::new();
-    if let Ok(file) = File::open("/etc/resolv.conf") {
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 && parts[0] == "nameserver" {
-                    if let Ok(ip) = parts[1].parse::<IpAddr>() {
-                        dns.push(ip);
-                    }
-                }
-            }
+    let file = File::open(PATH)
+        .map_err(|source| NetworkError::io("read DNS configuration", PATH, source))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line =
+            line.map_err(|source| NetworkError::io("read DNS configuration", PATH, source))?;
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 && parts[0] == "nameserver" {
+            let ip = parts[1]
+                .parse::<IpAddr>()
+                .map_err(|_| NetworkError::parse("macOS DNS nameserver address", parts[1]))?;
+            dns.push(ip);
         }
     }
-    dns
+    Ok(dns)
 }
 
 /// macOS 下获取所有网卡信息的统一实现
-pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
+pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取路由表；netstat 提供完整路由，route get 作为默认路由回退。
-    let mut routes = get_macos_route_table("inet", AddressFamily::Ipv4);
+    let mut routes = get_macos_route_table("inet", AddressFamily::Ipv4)?;
     let default_v4 = routes.iter().find(|route| route.is_default).cloned();
     if default_v4.is_none()
-        && let Some(route) = get_macos_default_route_v4()
+        && let Some(route) = get_macos_default_route_v4()?
     {
         routes.push(route);
     }
 
-    let mut v6_routes = get_macos_route_table("inet6", AddressFamily::Ipv6);
+    let mut v6_routes = get_macos_route_table("inet6", AddressFamily::Ipv6)?;
     let default_v6 = v6_routes.iter().find(|route| route.is_default).cloned();
     if default_v6.is_none()
-        && let Some(route) = get_macos_default_route_v6()
+        && let Some(route) = get_macos_default_route_v6()?
     {
         v6_routes.push(route);
     }
@@ -335,15 +384,17 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         .or_else(|| default_v6.as_ref().map(|route| route.interface.clone()));
 
     // 2. 加载硬件端口物理映射
-    let hardware_types = get_macos_interface_types();
+    let hardware_types = get_macos_interface_types()?;
 
     // 3. 遍历 getifaddrs 链表
     let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
     let res = unsafe { libc::getifaddrs(&mut ifap) };
     if res != 0 {
-        return Err("getifaddrs failed".to_string());
+        let code = std::io::Error::last_os_error()
+            .raw_os_error()
+            .map_or(0, |value| value as u32);
+        return Err(NetworkError::api("getifaddrs", code));
     }
-
     let mut interface_map: std::collections::HashMap<String, NetworkInterface> =
         std::collections::HashMap::new();
 
@@ -378,7 +429,13 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     prefix_len = mask_u32.count_ones() as u8;
                 }
 
-                let is_dhcp = check_is_dhcp_macos(&ifa_name);
+                let is_dhcp = match check_is_dhcp_macos(&ifa_name) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        unsafe { libc::freeifaddrs(ifap) };
+                        return Err(error);
+                    }
+                };
                 let alloc = if ifa_name.starts_with("lo") {
                     IpAllocation::Static
                 } else if is_dhcp {
@@ -429,7 +486,13 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     prefix_len = mask_bytes.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
                 }
 
-                let is_dhcp = check_is_dhcp_macos(&ifa_name);
+                let is_dhcp = match check_is_dhcp_macos(&ifa_name) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        unsafe { libc::freeifaddrs(ifap) };
+                        return Err(error);
+                    }
+                };
                 let alloc = if ifa_name.starts_with("lo") {
                     IpAllocation::Static
                 } else if is_dhcp {
@@ -476,8 +539,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 let mut mac_address = None;
                 if sdl_alen == 6 {
                     let mut mac_bytes = [0u8; 6];
-                    for i in 0..6 {
-                        mac_bytes[i] = sdl.sdl_data[sdl_nlen + i] as u8;
+                    for (i, byte) in mac_bytes.iter_mut().enumerate() {
+                        *byte = sdl.sdl_data[sdl_nlen + i] as u8;
                     }
                     let formatted = format!(
                         "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
@@ -546,7 +609,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
         current = ifa.ifa_next;
     }
 
-    unsafe { libc::freeifaddrs(ifap) };
+    if !ifap.is_null() {
+        unsafe { libc::freeifaddrs(ifap) };
+    }
 
     // 4. 后处理：精细化接口类型分类与映射
     for (name, interface) in &mut interface_map {
@@ -580,7 +645,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
             .collect();
         crate::shared::sort_routes(&mut interface.routes);
 
-        let is_dhcp = check_is_dhcp_macos(name);
+        let is_dhcp = check_is_dhcp_macos(name)?;
         let has_dynamic = interface
             .ipv4_addresses
             .iter()
@@ -605,7 +670,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     let mut other: Vec<NetworkInterface> = Vec::new();
 
     for iface in interface_map.into_values() {
-        let is_pri = primary_iface.as_ref().map_or(false, |p| p == &iface.name);
+        let is_pri = primary_iface.as_ref() == Some(&iface.name);
         if is_pri && primary.is_none() {
             primary = Some(iface);
         } else {
@@ -614,17 +679,17 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     }
 
     // 保底：若无主网卡，选择第一个非环回且绑定了IP地址的网卡
-    if primary.is_none() {
-        if let Some(pos) = other.iter().position(|i| {
+    if primary.is_none()
+        && let Some(pos) = other.iter().position(|i| {
             !i.name.starts_with("lo")
                 && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
-        }) {
-            primary = Some(other.remove(pos));
-        }
+        })
+    {
+        primary = Some(other.remove(pos));
     }
 
     // 5. 分配全局 DNS 信息给主网卡
-    let dns_list = parse_dns_servers();
+    let dns_list = parse_dns_servers()?;
     if let Some(ref mut pri) = primary {
         pri.dns_servers = dns_list;
     }
@@ -641,7 +706,8 @@ mod tests {
         let routes = parse_macos_route_table(
             "Destination Gateway Flags Netif Expire\ndefault 192.168.1.1 UGSc en0\n192.168.1/24 link#6 UCS en0",
             AddressFamily::Ipv4,
-        );
+        )
+        .expect("route table parsing should not fail");
 
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].destination, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
@@ -655,11 +721,25 @@ mod tests {
     }
 
     #[test]
+    fn treats_mac_gateway_as_a_direct_route() {
+        let routes = parse_macos_route_table(
+            "Destination Gateway Flags Netif Expire\n192.168.1/24 1:0:5e:0:0:fb UCS en0",
+            AddressFamily::Ipv4,
+        )
+        .expect("route table parsing should not fail");
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].gateway, None);
+        assert!(!routes[0].is_default);
+    }
+
+    #[test]
     fn parses_ipv6_link_local_gateway_scope() {
         let routes = parse_macos_route_table(
             "Destination Gateway Flags Netif Expire\ndefault fe80::1%en0 UGcg en0",
             AddressFamily::Ipv6,
-        );
+        )
+        .expect("route table parsing should not fail");
 
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].destination, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
