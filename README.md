@@ -15,7 +15,7 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
   - Physical medium: Ethernet, Wi-Fi, Loopback, Virtual/Bridge, Tunnel/VPN, and others.
   - Hardware addresses: MAC address detection and formatting.
   - Performance data: Active link speed (Gbps, Mbps, Kbps) and real-time traffic statistics (both received and transmitted bytes/packets).
-- Deep IP Topology: Fully parses multiple IPv4 and IPv6 bindings, subnet masks, prefix lengths, gateway paths, and allocation methods (Dynamic / Static).
+- Deep IP Topology: Fully parses multiple IPv4 and IPv6 bindings, subnet masks, prefix lengths, interface routes, next hops, and allocation methods (Dynamic / Static).
 - System DNS Diagnostics: Resolves and associates active system DNS servers.
 - Flexible Outputs:
   - Polished terminal layout with clean tree-like text alignments.
@@ -27,9 +27,9 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
 
 NetConfig relies on native operating system APIs for maximum performance and accuracy:
 
-- Windows: Uses the IP Helper (IPHLPAPI) library. Resolves the primary interface via GetBestInterface using a mock target IP address. Extracts adapters, unicast IPs, prefixes, PrefixOrigin (for DHCP/Static detection), gateways, and DNS servers using GetAdaptersAddresses. Queries traffic throughput statistics and hardware speeds using GetIfEntry2.
-- Linux: Parses /proc/net/route and /proc/net/ipv6_route to evaluate routing metrics and find the primary gateway. Queries system interfaces and IP details using libc::getifaddrs. Evaluates IPv6 IFA_F_PERMANENT flags in /proc/net/if_inet6, lease files (systemd-networkd, NetworkManager, dhclient), and active DHCP process lists to determine dynamic vs static allocations. Retrieves interface operational state, media type, link speed, MAC address, and traffic counters directly from /sys/class/net/<interface>/. Parses /etc/resolv.conf for DNS.
-- macOS: Detects the active interface by running route get default and route get -inet6 default and parsing the gateway. Uses networksetup -listallhardwareports to distinguish physical media. Runs ipconfig getpacket to detect DHCP packet headers and IP allocation mode. Uses libc::getifaddrs to list IP bindings, and parses AF_LINK for MAC addresses and hardware metrics. Parses /etc/resolv.conf for DNS.
+- Windows: Uses the IP Helper (IPHLPAPI) library. Resolves the primary interface via GetBestInterface using a mock target IP address. Extracts adapters, unicast IPs, prefixes, PrefixOrigin (for DHCP/Static detection), and DNS servers using GetAdaptersAddresses; extracts destination prefixes, next hops, interface indexes, and metrics using GetIpForwardTable2. Queries traffic throughput statistics and hardware speeds using GetIfEntry2.
+- Linux: Parses /proc/net/route and /proc/net/ipv6_route to retain destination prefixes, next hops, interface names, and routing metrics. Queries system interfaces and IP details using libc::getifaddrs. Evaluates IPv6 IFA_F_PERMANENT flags in /proc/net/if_inet6, lease files (systemd-networkd, NetworkManager, dhclient), and active DHCP process lists to determine dynamic vs static allocations. Retrieves interface operational state, media type, link speed, MAC address, and traffic counters directly from /sys/class/net/<interface>/. Parses /etc/resolv.conf for DNS.
+- macOS: Reads complete IPv4 and IPv6 route tables with netstat -rn and uses route get default as a fallback, preserving link-local gateway scopes and interface associations. Uses networksetup -listallhardwareports to distinguish physical media. Runs ipconfig getpacket to detect DHCP packet headers and IP allocation mode. Uses libc::getifaddrs to list IP bindings, and parses AF_LINK for MAC addresses and hardware metrics. Parses /etc/resolv.conf for DNS.
 
 ## Installation
 
@@ -71,7 +71,7 @@ Precompiled binaries for various platforms are available in the GitHub Releases:
 To build NetConfig from source, you need a standard Rust toolchain installed:
 
 ```bash
-git clone https://github.com/your-username/net-config.git
+git clone https://github.com/shaogme/net-config.git
 cd net-config
 cargo build --release
 ```
@@ -111,13 +111,20 @@ Below is an example of the text representation in English:
  IPv4 Config   :
    [1] Address    : 192.168.1.100
        Subnet Mask: 255.255.255.0 (Prefix /24)
-       Gateway    : 192.168.1.1
        Allocation : Dynamic (DHCP)
  IPv6 Config   :
    [1] Address    : fe80::1000:2000:3000:4000
        Prefix Len : /64
-       Gateway    : fe80::1
        Allocation : Dynamic (DHCP)
+ Routes        :
+   [1] Destination: Default
+       Gateway    : 192.168.1.1
+       Interface  : en0
+       Metric     : 100
+   [2] Destination: fe80::/64
+       Gateway    : On-link / None
+       Interface  : en0
+       Metric     : 256
  DNS Servers   :
    ├── 1.1.1.1
    └── 8.8.8.8
@@ -141,9 +148,6 @@ Below is an example of the text representation in English:
         "address": "192.168.1.100",
         "netmask": "255.255.255.0",
         "prefix_len": 24,
-        "gateways": [
-          "192.168.1.1"
-        ],
         "allocation": "Dynamic"
       }
     ],
@@ -151,10 +155,29 @@ Below is an example of the text representation in English:
       {
         "address": "fe80::1000:2000:3000:4000",
         "prefix_len": 64,
-        "gateways": [
-          "fe80::1"
-        ],
         "allocation": "Dynamic"
+      }
+    ],
+    "routes": [
+      {
+        "family": "ipv4",
+        "destination": "0.0.0.0",
+        "prefix_len": 0,
+        "gateway": "192.168.1.1",
+        "gateway_scope": null,
+        "interface": "en0",
+        "metric": 100,
+        "is_default": true
+      },
+      {
+        "family": "ipv6",
+        "destination": "fe80::",
+        "prefix_len": 64,
+        "gateway": null,
+        "gateway_scope": null,
+        "interface": "en0",
+        "metric": 256,
+        "is_default": false
       }
     ],
     "status": "Up",

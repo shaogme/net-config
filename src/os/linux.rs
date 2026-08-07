@@ -1,6 +1,6 @@
 use crate::shared::{
-    InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info, Ipv6Info,
-    NetworkInterface, NetworkInterfaces,
+    AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
+    Ipv6Info, NetworkInterface, NetworkInterfaces, Route,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -10,40 +10,58 @@ use std::ptr;
 
 struct LinuxRouteV4 {
     iface: String,
-    gateway: Ipv4Addr,
+    destination: Ipv4Addr,
+    prefix_len: u8,
+    gateway: Option<Ipv4Addr>,
     metric: u32,
     is_default: bool,
+}
+
+impl LinuxRouteV4 {
+    fn to_route(&self) -> Route {
+        Route {
+            family: AddressFamily::Ipv4,
+            destination: self.destination.into(),
+            prefix_len: self.prefix_len,
+            gateway: self.gateway.map(IpAddr::V4),
+            gateway_scope: None,
+            interface: self.iface.clone(),
+            metric: Some(self.metric),
+            is_default: self.is_default,
+        }
+    }
+}
+
+fn parse_ipv4_route_line(line: &str) -> Option<LinuxRouteV4> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 8 {
+        return None;
+    }
+
+    let destination_raw = u32::from_str_radix(parts[1], 16).ok()?;
+    let gateway_raw = u32::from_str_radix(parts[2], 16).ok()?;
+    let metric = parts[6].parse::<u32>().ok()?;
+    let mask_raw = u32::from_str_radix(parts[7], 16).ok()?;
+    let destination = Ipv4Addr::from(destination_raw.to_ne_bytes());
+    let gateway = Ipv4Addr::from(gateway_raw.to_ne_bytes());
+
+    Some(LinuxRouteV4 {
+        iface: parts[0].to_string(),
+        destination,
+        prefix_len: mask_raw.count_ones() as u8,
+        gateway: (!gateway.is_unspecified()).then_some(gateway),
+        metric,
+        is_default: destination.is_unspecified() && mask_raw == 0,
+    })
 }
 
 fn parse_ipv4_routes() -> Vec<LinuxRouteV4> {
     let mut routes = Vec::new();
     if let Ok(file) = File::open("/proc/net/route") {
         let reader = BufReader::new(file);
-        for line in reader.lines().skip(1) {
-            if let Ok(line) = line {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 8 {
-                    let iface = parts[0].to_string();
-                    let dest_hex = parts[1];
-                    let gateway_hex = parts[2];
-                    let metric_str = parts[6];
-
-                    if let (Ok(dest), Ok(gateway), Ok(metric)) = (
-                        u32::from_str_radix(dest_hex, 16),
-                        u32::from_str_radix(gateway_hex, 16),
-                        u32::from_str_radix(metric_str, 10),
-                    ) {
-                        let gw_bytes = gateway.to_ne_bytes();
-                        let gw_ip = Ipv4Addr::from(gw_bytes);
-
-                        routes.push(LinuxRouteV4 {
-                            iface,
-                            gateway: gw_ip,
-                            metric,
-                            is_default: dest == 0,
-                        });
-                    }
-                }
+        for line in reader.lines().skip(1).map_while(Result::ok) {
+            if let Some(route) = parse_ipv4_route_line(&line) {
+                routes.push(route);
             }
         }
     }
@@ -52,9 +70,31 @@ fn parse_ipv4_routes() -> Vec<LinuxRouteV4> {
 
 struct LinuxRouteV6 {
     iface: String,
-    gateway: Ipv6Addr,
+    destination: Ipv6Addr,
+    prefix_len: u8,
+    gateway: Option<Ipv6Addr>,
     metric: u32,
     is_default: bool,
+}
+
+impl LinuxRouteV6 {
+    fn to_route(&self) -> Route {
+        let gateway_scope = self
+            .gateway
+            .filter(|address| address.is_unicast_link_local())
+            .map(|_| self.iface.clone());
+
+        Route {
+            family: AddressFamily::Ipv6,
+            destination: self.destination.into(),
+            prefix_len: self.prefix_len,
+            gateway: self.gateway.map(IpAddr::V6),
+            gateway_scope,
+            interface: self.iface.clone(),
+            metric: Some(self.metric),
+            is_default: self.is_default,
+        }
+    }
 }
 
 fn parse_hex_to_ipv6(hex_str: &str) -> Result<Ipv6Addr, String> {
@@ -69,37 +109,37 @@ fn parse_hex_to_ipv6(hex_str: &str) -> Result<Ipv6Addr, String> {
     Ok(Ipv6Addr::from(bytes))
 }
 
+fn parse_ipv6_route_line(line: &str) -> Option<LinuxRouteV6> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 10 {
+        return None;
+    }
+
+    let destination = parse_hex_to_ipv6(parts[0]).ok()?;
+    let prefix_len = u8::from_str_radix(parts[1], 16).ok()?;
+    if prefix_len > 128 {
+        return None;
+    }
+    let gateway = parse_hex_to_ipv6(parts[4]).ok()?;
+    let metric = u32::from_str_radix(parts[5], 16).ok()?;
+
+    Some(LinuxRouteV6 {
+        iface: parts[9].to_string(),
+        destination,
+        prefix_len,
+        gateway: (!gateway.is_unspecified()).then_some(gateway),
+        metric,
+        is_default: destination.is_unspecified() && prefix_len == 0,
+    })
+}
+
 fn parse_ipv6_routes() -> Vec<LinuxRouteV6> {
     let mut routes = Vec::new();
     if let Ok(file) = File::open("/proc/net/ipv6_route") {
         let reader = BufReader::new(file);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 10 {
-                    let dest_hex = parts[0];
-                    let prefix_hex = parts[1];
-                    let next_hop_hex = parts[4];
-                    let metric_hex = parts[5];
-                    let iface = parts[9].to_string();
-
-                    if dest_hex.len() == 32 && next_hop_hex.len() == 32 {
-                        let is_default =
-                            dest_hex == "00000000000000000000000000000000" && prefix_hex == "00";
-
-                        if let (Ok(gateway), Ok(metric)) = (
-                            parse_hex_to_ipv6(next_hop_hex),
-                            u32::from_str_radix(metric_hex, 16),
-                        ) {
-                            routes.push(LinuxRouteV6 {
-                                iface,
-                                gateway,
-                                metric,
-                                is_default,
-                            });
-                        }
-                    }
-                }
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(route) = parse_ipv6_route_line(&line) {
+                routes.push(route);
             }
         }
     }
@@ -178,17 +218,17 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     let v6_routes = parse_ipv6_routes();
     let v6_perm_map = parse_ipv6_permanent_map();
 
-    // 找出 Metric 最小且网关有效的默认路由作为主网卡接口
+    // 找出 Metric 最小的默认路由作为主网卡接口；点对点默认路由可以没有网关。
     let primary_v4_iface = v4_routes
         .iter()
-        .filter(|r| r.is_default && r.gateway != Ipv4Addr::UNSPECIFIED)
-        .min_by_key(|r| r.metric)
+        .filter(|r| r.is_default)
+        .min_by_key(|r| (r.metric, r.iface.as_str()))
         .map(|r| r.iface.clone());
 
     let primary_v6_iface = v6_routes
         .iter()
-        .filter(|r| r.is_default && r.gateway != Ipv6Addr::UNSPECIFIED)
-        .min_by_key(|r| r.metric)
+        .filter(|r| r.is_default)
+        .min_by_key(|r| (r.metric, r.iface.as_str()))
         .map(|r| r.iface.clone());
 
     let primary_iface = primary_v4_iface.or(primary_v6_iface);
@@ -234,13 +274,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     prefix_len = mask_u32.count_ones() as u8;
                 }
 
-                // 收集绑定在该网卡上的有效网关
-                let gateways = v4_routes
-                    .iter()
-                    .filter(|r| r.iface == ifa_name && r.gateway != Ipv4Addr::UNSPECIFIED)
-                    .map(|r| r.gateway)
-                    .collect::<Vec<Ipv4Addr>>();
-
                 let is_dhcp = is_dhcp_interface_linux(&ifa_name);
                 let alloc = if ifa_name == "lo" {
                     IpAllocation::Static
@@ -254,7 +287,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     address: ip,
                     netmask,
                     prefix_len,
-                    gateways,
                     allocation: alloc,
                 };
 
@@ -268,6 +300,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                             mac_address: None,
                             ipv4_addresses: Vec::new(),
                             ipv6_addresses: Vec::new(),
+                            routes: Vec::new(),
                             status: if is_up {
                                 InterfaceStatus::Up
                             } else {
@@ -292,12 +325,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                     prefix_len = mask_bytes.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
                 }
 
-                let gateways = v6_routes
-                    .iter()
-                    .filter(|r| r.iface == ifa_name && r.gateway != Ipv6Addr::UNSPECIFIED)
-                    .map(|r| r.gateway)
-                    .collect::<Vec<Ipv6Addr>>();
-
                 let is_dhcp = is_dhcp_interface_linux(&ifa_name);
                 let alloc = if ifa_name == "lo" {
                     IpAllocation::Static
@@ -316,7 +343,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                 let ipv6_info = Ipv6Info {
                     address: ip,
                     prefix_len,
-                    gateways,
                     allocation: alloc,
                 };
 
@@ -330,6 +356,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
                             mac_address: None,
                             ipv4_addresses: Vec::new(),
                             ipv6_addresses: Vec::new(),
+                            routes: Vec::new(),
                             status: if is_up {
                                 InterfaceStatus::Up
                             } else {
@@ -478,6 +505,20 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
             });
         }
 
+        // 将路由挂在接口上，而不是复制到该接口的每个 IP 地址。
+        interface.routes = v4_routes
+            .iter()
+            .filter(|route| route.iface == *name)
+            .map(LinuxRouteV4::to_route)
+            .chain(
+                v6_routes
+                    .iter()
+                    .filter(|route| route.iface == *name)
+                    .map(LinuxRouteV6::to_route),
+            )
+            .collect();
+        crate::shared::sort_routes(&mut interface.routes);
+
         // 6. 确定网卡协议栈/IP 分配方式
         let is_dhcp = is_dhcp_interface_linux(name);
         let has_dynamic = interface
@@ -545,4 +586,51 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
     }
 
     Ok(NetworkInterfaces { primary, other })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ipv4_default_route_without_gateway() {
+        let route = parse_ipv4_route_line("ppp0 00000000 00000000 0000 0 0 10 00000000 0 0 0")
+            .expect("default route should parse");
+
+        assert_eq!(route.destination, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(route.prefix_len, 0);
+        assert_eq!(route.gateway, None);
+        assert!(route.is_default);
+        assert_eq!(route.to_route().gateway, None);
+    }
+
+    #[test]
+    fn parses_ipv4_network_and_gateway_separately() {
+        let route = parse_ipv4_route_line("eth0 0000A8C0 0100A8C0 0003 0 0 100 0000FFFF 0 0 0")
+            .expect("IPv4 route should parse");
+
+        assert_eq!(route.destination, Ipv4Addr::new(192, 168, 0, 0));
+        assert_eq!(route.prefix_len, 16);
+        assert_eq!(route.gateway, Some(Ipv4Addr::new(192, 168, 0, 1)));
+        assert!(!route.is_default);
+    }
+
+    #[test]
+    fn parses_ipv6_route_and_preserves_interface_scope() {
+        let route = parse_ipv6_route_line(
+            "20010db8000000000000000000000000 40 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000010 00000000 00000000 00000001 eth0",
+        )
+        .expect("IPv6 route should parse");
+
+        assert_eq!(
+            route.destination,
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(route.prefix_len, 64);
+        assert_eq!(
+            route.gateway,
+            Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))
+        );
+        assert_eq!(route.to_route().gateway_scope, Some("eth0".to_string()));
+    }
 }

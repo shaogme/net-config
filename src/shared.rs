@@ -36,6 +36,48 @@ pub enum IpAllocation {
     Unknown,
 }
 
+/// 路由使用的地址族
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+/// 与某个网络接口关联的路由
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    /// 地址族
+    pub family: AddressFamily,
+    /// 目的网络地址
+    pub destination: IpAddr,
+    /// 目的网络前缀长度
+    pub prefix_len: u8,
+    /// 下一跳地址；直连或点对点路由可能没有下一跳
+    pub gateway: Option<IpAddr>,
+    /// IPv6 link-local 下一跳的作用域接口
+    pub gateway_scope: Option<String>,
+    /// 路由所属接口名称
+    pub interface: String,
+    /// 路由 metric；平台未提供时为 None
+    pub metric: Option<u32>,
+    /// 是否为默认路由
+    pub is_default: bool,
+}
+
+/// 按稳定规则排序路由，避免 HashMap 或平台 API 顺序泄漏到输出。
+pub fn sort_routes(routes: &mut [Route]) {
+    routes.sort_by(|left, right| {
+        left.family
+            .cmp(&right.family)
+            .then_with(|| left.destination.cmp(&right.destination))
+            .then_with(|| left.prefix_len.cmp(&right.prefix_len))
+            .then_with(|| left.metric.cmp(&right.metric))
+            .then_with(|| left.gateway.cmp(&right.gateway))
+            .then_with(|| left.interface.cmp(&right.interface))
+    });
+}
+
 /// 流量数据吞吐统计
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct InterfaceStats {
@@ -63,10 +105,12 @@ pub struct NetworkInterface {
     pub description: String,
     /// MAC 地址（格式化为 "XX:XX:XX:XX:XX:XX"）
     pub mac_address: Option<String>,
-    /// IPv4 绑定列表（IP、子网掩码、网关）
+    /// IPv4 绑定列表（IP、子网掩码）
     pub ipv4_addresses: Vec<Ipv4Info>,
-    /// IPv6 绑定列表（IP、前缀长度、网关）
+    /// IPv6 绑定列表（IP、前缀长度）
     pub ipv6_addresses: Vec<Ipv6Info>,
+    /// 与该接口关联的路由列表
+    pub routes: Vec<Route>,
     /// 接口状态
     pub status: InterfaceStatus,
     /// 接口类型
@@ -90,8 +134,6 @@ pub struct Ipv4Info {
     pub netmask: Ipv4Addr,
     /// 前缀长度（如 24）
     pub prefix_len: u8,
-    /// 该网卡关联的网关列表
-    pub gateways: Vec<Ipv4Addr>,
     /// IP 分配方式（动态/静态/未知）
     pub allocation: IpAllocation,
 }
@@ -103,8 +145,6 @@ pub struct Ipv6Info {
     pub address: Ipv6Addr,
     /// 前缀长度（如 64）
     pub prefix_len: u8,
-    /// 该网卡关联的网关列表
-    pub gateways: Vec<Ipv6Addr>,
     /// IP 分配方式（动态/静态/未知）
     pub allocation: IpAllocation,
 }

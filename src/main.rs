@@ -189,16 +189,6 @@ fn print_interface(face: &shared::NetworkInterface) {
                 t!(Ipv4PrefixSuffix),
                 ipv4.prefix_len
             );
-            let gw_str = if !ipv4.gateways.is_empty() {
-                ipv4.gateways
-                    .iter()
-                    .map(|ip| ip.to_string())
-                    .collect::<Vec<String>>()
-                    .join(", ")
-            } else {
-                t!(Ipv4GatewayNone).to_string()
-            };
-            println!("       {}: {}", t!(Ipv4GatewayLabel, 11), gw_str);
             println!(
                 "       {}: {}",
                 t!(Ipv4AllocLabel, 11),
@@ -213,16 +203,6 @@ fn print_interface(face: &shared::NetworkInterface) {
         for (i, ipv6) in face.ipv6_addresses.iter().enumerate() {
             println!("   [{}] {}: {}", i + 1, t!(Ipv6AddrLabel, 11), ipv6.address);
             println!("       {}: /{}", t!(Ipv6PrefixLabel, 11), ipv6.prefix_len);
-            let gw_str = if !ipv6.gateways.is_empty() {
-                ipv6.gateways
-                    .iter()
-                    .map(|ip| ip.to_string())
-                    .collect::<Vec<String>>()
-                    .join(", ")
-            } else {
-                t!(Ipv6GatewayNone).to_string()
-            };
-            println!("       {}: {}", t!(Ipv6GatewayLabel, 11), gw_str);
             println!(
                 "       {}: {}",
                 t!(Ipv6AllocLabel, 11),
@@ -231,7 +211,40 @@ fn print_interface(face: &shared::NetworkInterface) {
         }
     }
 
-    // 8. DNS 服务器配置 (采用树状结构)
+    // 8. 路由配置
+    if !face.routes.is_empty() {
+        println!(" {}:", t!(Routes));
+        for (i, route) in face.routes.iter().enumerate() {
+            let destination = if route.is_default {
+                t!(RouteDefault).to_string()
+            } else {
+                format!("{}/{}", route.destination, route.prefix_len)
+            };
+            let gateway = match (route.gateway, route.gateway_scope.as_deref()) {
+                (Some(std::net::IpAddr::V6(address)), Some(scope)) => {
+                    format!("{}%{}", address, scope)
+                }
+                (Some(address), _) => address.to_string(),
+                (None, _) => t!(RouteGatewayNone).to_string(),
+            };
+            let metric = route.metric.map_or_else(
+                || t!(RouteMetricUnknown).to_string(),
+                |value| value.to_string(),
+            );
+
+            println!(
+                "   [{}] {}: {}",
+                i + 1,
+                t!(RouteDestination, 11),
+                destination
+            );
+            println!("       {}: {}", t!(RouteGateway, 11), gateway);
+            println!("       {}: {}", t!(RouteInterface, 11), route.interface);
+            println!("       {}: {}", t!(RouteMetric, 11), metric);
+        }
+    }
+
+    // 9. DNS 服务器配置 (采用树状结构)
     if !face.dns_servers.is_empty() {
         println!(" {}:", t!(DnsServers));
         let len = face.dns_servers.len();
@@ -246,7 +259,7 @@ fn print_interface(face: &shared::NetworkInterface) {
         }
     }
 
-    // 9. 网络吞吐流量统计 (采用树状结构)
+    // 10. 网络吞吐流量统计 (采用树状结构)
     if let Some(ref stats) = face.statistics {
         println!(" {}:", t!(Statistics));
         println!(
