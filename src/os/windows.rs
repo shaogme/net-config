@@ -10,9 +10,10 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use crate::shared::{
-    AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route, select_primary_interface,
-    sort_interfaces, sort_routes,
+    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceStats, InterfaceStatus,
+    InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface,
+    NetworkInterfaces, Route, aggregate_allocations, select_primary_interface, sort_interfaces,
+    sort_routes,
 };
 use std::net::IpAddr;
 
@@ -136,6 +137,24 @@ fn prefix_to_ipv4_mask(prefix: u8) -> Ipv4Addr {
     }
 }
 
+fn windows_ip_allocation(
+    family: AddressFamily,
+    prefix_origin: i32,
+    suffix_origin: i32,
+) -> IpAllocation {
+    match prefix_origin {
+        0 | 2 => IpAllocation::Other,
+        1 => IpAllocation::Manual,
+        3 => match family {
+            AddressFamily::Ipv4 => IpAllocation::Dhcpv4,
+            AddressFamily::Ipv6 => IpAllocation::Dhcpv6,
+        },
+        4 if family == AddressFamily::Ipv6 && matches!(suffix_origin, 4 | 5) => IpAllocation::Slaac,
+        4 => IpAllocation::RouterAdvertisement,
+        _ => IpAllocation::Unknown,
+    }
+}
+
 pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取主网卡接口索引 (GetBestInterface)
     let mut best_index = 0u32;
@@ -181,6 +200,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
 
     let mut primary: Option<NetworkInterface> = None;
     let mut other: Vec<NetworkInterface> = Vec::new();
+    let mut dns_servers = Vec::new();
 
     let mut current = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
 
@@ -260,21 +280,17 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             if !lp_sockaddr.is_null() {
                 let sa_family = unsafe { (*lp_sockaddr).sa_family };
                 let prefix_origin = unicast.PrefixOrigin;
-                let is_dhcp_adapter = (unsafe { adapter.Anonymous2.Flags } & 0x0004) != 0;
-
-                let alloc = match prefix_origin {
-                    1 => IpAllocation::Static,
-                    3 | 4 => IpAllocation::Dynamic,
+                let family = match sa_family as u32 {
+                    value if value == AF_INET as u32 => AddressFamily::Ipv4,
+                    value if value == AF_INET6 as u32 => AddressFamily::Ipv6,
                     _ => {
-                        if is_dhcp_adapter {
-                            IpAllocation::Dynamic
-                        } else {
-                            IpAllocation::Static
-                        }
+                        unicast_ptr = unicast.Next;
+                        continue;
                     }
                 };
+                let alloc = windows_ip_allocation(family, prefix_origin, unicast.SuffixOrigin);
 
-                if sa_family as u32 == AF_INET as u32 {
+                if family == AddressFamily::Ipv4 {
                     let sock_in = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN) };
                     // 提取 IPv4 地址字节
                     let s_addr = unsafe { sock_in.sin_addr.S_un.S_addr };
@@ -353,7 +369,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
         };
 
         // 提取 DNS 服务器地址
-        let mut dns_servers = Vec::new();
         let mut dns_ptr = adapter.FirstDnsServerAddress;
         while !dns_ptr.is_null() {
             let dns_addr = unsafe { &*dns_ptr };
@@ -364,11 +379,19 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     let sock_in = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN) };
                     let s_addr = unsafe { sock_in.sin_addr.S_un.S_addr };
                     let ip_bytes = s_addr.to_ne_bytes();
-                    dns_servers.push(IpAddr::V4(Ipv4Addr::from(ip_bytes)));
+                    dns_servers.push(DnsServer {
+                        address: IpAddr::V4(Ipv4Addr::from(ip_bytes)),
+                        interface: Some(name.clone()),
+                        source: DnsSource::WindowsAdapter,
+                    });
                 } else if sa_family as u32 == AF_INET6 as u32 {
                     let sock_in6 = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN6) };
                     let ip_bytes = unsafe { sock_in6.sin6_addr.u.Byte };
-                    dns_servers.push(IpAddr::V6(Ipv6Addr::from(ip_bytes)));
+                    dns_servers.push(DnsServer {
+                        address: IpAddr::V6(Ipv6Addr::from(ip_bytes)),
+                        interface: Some(name.clone()),
+                        source: DnsSource::WindowsAdapter,
+                    });
                 }
             }
             dns_ptr = dns_addr.Next;
@@ -389,20 +412,12 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             None
         };
 
-        let is_dhcp_enabled = (unsafe { adapter.Anonymous2.Flags } & 0x0004) != 0;
-        let has_dynamic_ip = ipv4_addresses
-            .iter()
-            .any(|i| i.allocation == IpAllocation::Dynamic)
-            || ipv6_addresses
+        let allocation = aggregate_allocations(
+            ipv4_addresses
                 .iter()
-                .any(|i| i.allocation == IpAllocation::Dynamic);
-        let allocation = if is_dhcp_enabled || has_dynamic_ip {
-            IpAllocation::Dynamic
-        } else if !ipv4_addresses.is_empty() || !ipv6_addresses.is_empty() {
-            IpAllocation::Static
-        } else {
-            IpAllocation::Unknown
-        };
+                .map(|address| address.allocation)
+                .chain(ipv6_addresses.iter().map(|address| address.allocation)),
+        );
 
         let iface = NetworkInterface {
             name,
@@ -415,7 +430,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             interface_type,
             allocation,
             link_speed,
-            dns_servers,
             statistics,
         };
 
@@ -435,7 +449,12 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
         primary = Some(other.remove(index));
     }
 
-    Ok(NetworkInterfaces { primary, other })
+    let dns = DnsConfiguration::from_servers(dns_servers);
+    Ok(NetworkInterfaces {
+        primary,
+        other,
+        dns,
+    })
 }
 
 #[cfg(test)]
@@ -449,6 +468,30 @@ mod tests {
         assert_eq!(
             normalize_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
             Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+        );
+    }
+
+    #[test]
+    fn maps_windows_address_origins_without_adapter_fallback() {
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv4, 3, 0),
+            IpAllocation::Dhcpv4
+        );
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv6, 3, 0),
+            IpAllocation::Dhcpv6
+        );
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv6, 4, 5),
+            IpAllocation::Slaac
+        );
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv6, 4, 1),
+            IpAllocation::RouterAdvertisement
+        );
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv4, 5, 0),
+            IpAllocation::Unknown
         );
     }
 }

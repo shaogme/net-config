@@ -9,14 +9,14 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
 ## Features
 
 - Primary Interface Auto-Detection: Automatically resolves the active gateway and primary network interface based on OS routing metrics and system APIs.
-- Protocol Stack Allocation Detection: Automatically detects and identifies whether network interfaces and their IP bindings use Dynamic allocation (DHCP / SLAAC) or Static manual configuration.
+- Protocol Stack Allocation Sources: Preserves Manual, DHCPv4, DHCPv6, Router Advertisement, SLAAC, Other, and Unknown at address level; interfaces with multiple sources are reported as Mixed instead of being inferred as Static.
 - Comprehensive Interface Data:
   - Network state: Up, Down, Testing, or Unknown.
   - Physical medium: Ethernet, Wi-Fi, Loopback, Virtual/Bridge, Tunnel/VPN, and others.
   - Hardware addresses: MAC address detection and formatting.
   - Performance data: Active link speed (Gbps, Mbps, Kbps) and real-time traffic statistics (both received and transmitted bytes/packets).
-- Deep IP Topology: Fully parses multiple IPv4 and IPv6 bindings, subnet masks, prefix lengths, interface routes, next hops, and allocation methods (Dynamic / Static).
-- System DNS Diagnostics: Resolves and associates active system DNS servers.
+- Deep IP Topology: Fully parses multiple IPv4 and IPv6 bindings, subnet masks, prefix lengths, interface routes, next hops, and address-level allocation sources.
+- System DNS Diagnostics: Collects DNS as an independent system result with server source, optional interface association, and available/none/unavailable status.
 - Flexible Outputs:
   - Polished terminal layout with clean tree-like text alignments.
   - Structured, pretty-printed JSON output for easy shell piping and automation.
@@ -27,9 +27,9 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
 
 NetConfig relies on native operating system APIs for maximum performance and accuracy:
 
-- Windows: Uses the IP Helper (IPHLPAPI) library. Resolves the primary interface via GetBestInterface using a mock target IP address. Extracts adapters, unicast IPs, prefixes, PrefixOrigin (for DHCP/Static detection), and DNS servers using GetAdaptersAddresses; extracts destination prefixes, next hops, interface indexes, and metrics using GetIpForwardTable2. Queries traffic throughput statistics and hardware speeds using GetIfEntry2.
-- Linux: Parses /proc/net/route and /proc/net/ipv6_route to retain destination prefixes, next hops, interface names, and routing metrics. Queries system interfaces and IP details using libc::getifaddrs. Evaluates IPv6 IFA_F_PERMANENT flags in /proc/net/if_inet6, lease files (systemd-networkd, NetworkManager, dhclient), and active DHCP process lists to determine dynamic vs static allocations. Retrieves interface operational state, media type, link speed, MAC address, and traffic counters directly from /sys/class/net/<interface>/. Parses /etc/resolv.conf for DNS.
-- macOS: Reads complete IPv4 and IPv6 route tables with netstat -rn and uses route get default as a fallback, preserving link-local gateway scopes and interface associations. Uses networksetup -listallhardwareports to distinguish physical media. Runs ipconfig getpacket to detect DHCP packet headers and IP allocation mode. Uses libc::getifaddrs to list IP bindings, and parses AF_LINK for MAC addresses and hardware metrics. Parses /etc/resolv.conf for DNS.
+- Windows: Uses the IP Helper (IPHLPAPI) library. Resolves the primary interface via GetBestInterface using a mock target IP address. Extracts unicast PrefixOrigin/SuffixOrigin values with GetAdaptersAddresses to distinguish DHCP, Manual, Router Advertisement, and SLAAC without using the adapter DHCP flag as an address-level fallback; DNS is emitted as an interface-associated system result.
+- Linux: Parses /proc/net/route and /proc/net/ipv6_route to retain destination prefixes, next hops, interface names, and routing metrics. Queries system interfaces and IP details using libc::getifaddrs. Marks only addresses explicitly present in system DHCP leases as DHCP, uses IPv6 privacy/SLAAC flags as SLAAC evidence, and leaves unsupported inferences Unknown. Retrieves interface operational state, media type, link speed, MAC address, and traffic counters directly from /sys/class/net/<interface>/. Collects DNS from systemd-resolved, NetworkManager, and finally resolv.conf while preserving source and interface scope.
+- macOS: Reads complete IPv4 and IPv6 route tables with netstat -rn and uses route get default as a fallback, preserving link-local gateway scopes and interface associations. Uses networksetup -listallhardwareports to distinguish physical media. Caches per-interface ipconfig DHCP/DHCPv6 probes and reads ifconfig autoconf/temporary flags for SLAAC; unsupported inferences remain Unknown. Uses libc::getifaddrs to list IP bindings, and parses AF_LINK for MAC addresses and hardware metrics. Uses scutil --dns first and records resolv.conf as an explicit fallback source.
 
 ## Installation
 
@@ -105,17 +105,17 @@ Below is an example of the text representation in English:
  Description   : en0
  Status        : Up
  Type          : Wi-Fi
- Allocation    : Dynamic (DHCP)
+ Allocation    : Mixed
  Link Speed    : 1.20 Gbps
  MAC Address   : 00:00:5E:00:53:01
  IPv4 Config   :
    [1] Address    : 192.168.1.100
        Subnet Mask: 255.255.255.0 (Prefix /24)
-       Allocation : Dynamic (DHCP)
+       Allocation : DHCPv4
  IPv6 Config   :
    [1] Address    : fe80::1000:2000:3000:4000
        Prefix Len : /64
-       Allocation : Dynamic (DHCP)
+       Allocation : Other
  Routes        :
    [1] Destination: Default
        Gateway    : 192.168.1.1
@@ -125,12 +125,15 @@ Below is an example of the text representation in English:
        Gateway    : On-link / None
        Interface  : en0
        Metric     : 256
- DNS Servers   :
-   ├── 1.1.1.1
-   └── 8.8.8.8
  Statistics    :
-   ├── Received (Rx)   : 1.20 GiB (900000 packets)
-   └── Transmitted (Tx): 320.50 MiB (250000 packets)
+    ├── Received (Rx)   : 1.20 GiB (900000 packets)
+    └── Transmitted (Tx): 320.50 MiB (250000 packets)
+
+[System DNS]
+ DNS Servers   :
+   [1] Address    : 1.1.1.1
+       Interface  : en0
+       Source     : scutil
 
 ==================================================================
 ```
@@ -148,14 +151,14 @@ Below is an example of the text representation in English:
         "address": "192.168.1.100",
         "netmask": "255.255.255.0",
         "prefix_len": 24,
-        "allocation": "Dynamic"
+        "allocation": "dhcpv4"
       }
     ],
     "ipv6_addresses": [
       {
         "address": "fe80::1000:2000:3000:4000",
         "prefix_len": 64,
-        "allocation": "Dynamic"
+        "allocation": "other"
       }
     ],
     "routes": [
@@ -182,12 +185,8 @@ Below is an example of the text representation in English:
     ],
     "status": "Up",
     "interface_type": "WiFi",
-    "allocation": "Dynamic",
+    "allocation": "mixed",
     "link_speed": 1200000000,
-    "dns_servers": [
-      "1.1.1.1",
-      "8.8.8.8"
-    ],
     "statistics": {
       "rx_bytes": 1288490188,
       "tx_bytes": 336068608,
@@ -195,7 +194,22 @@ Below is an example of the text representation in English:
       "tx_packets": 250000
     }
   },
-  "other": []
+  "other": [],
+  "dns": {
+    "status": "available",
+    "servers": [
+      {
+        "address": "1.1.1.1",
+        "interface": "en0",
+        "source": "scutil"
+      },
+      {
+        "address": "8.8.8.8",
+        "interface": null,
+        "source": "scutil"
+      }
+    ]
+  }
 }
 ```
 

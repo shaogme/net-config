@@ -1,12 +1,16 @@
 use crate::shared::{
-    AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route, select_primary_interface,
+    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceStats, InterfaceStatus,
+    InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface,
+    NetworkInterfaces, Route, aggregate_allocations, parse_resolv_conf, select_primary_interface,
     sort_interfaces, sort_routes,
 };
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
+use std::process::Command;
 use std::ptr;
 
 struct LinuxRouteV4 {
@@ -167,53 +171,110 @@ fn parse_ipv6_routes() -> Result<Vec<LinuxRouteV6>, NetworkError> {
     Ok(routes)
 }
 
-fn is_dhcp_interface_linux(iface: &str) -> bool {
-    if iface == "lo" {
-        return false;
-    }
-    if std::path::Path::new("/run/systemd/netif/leases").exists()
-        && let Ok(entries) = std::fs::read_dir("/run/systemd/netif/leases")
-    {
-        for entry in entries.flatten() {
-            if let Ok(content) = std::fs::read_to_string(entry.path())
-                && content.contains(&format!("INTERFACE={}", iface))
-            {
-                return true;
-            }
-        }
-    }
-    let nm_paths = [
-        format!("/var/lib/NetworkManager/dhclient-{}.lease", iface),
-        format!("/var/lib/NetworkManager/dhclient6-{}.lease", iface),
-        format!("/var/lib/dhcp/dhclient-{}.leases", iface),
-        format!("/var/lib/dhcpcd/{}.lease", iface),
-    ];
-    for path in &nm_paths {
-        if std::path::Path::new(path).exists() {
-            return true;
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let pid_path = entry.path().join("cmdline");
-            if pid_path.exists()
-                && let Ok(cmdline) = std::fs::read_to_string(pid_path)
-                && (cmdline.contains("dhclient")
-                    || cmdline.contains("dhcpcd")
-                    || cmdline.contains("udhcpc"))
-                && cmdline.contains(iface)
-            {
-                return true;
-            }
-        }
-    }
-    false
+#[derive(Debug, Default)]
+struct LinuxDhcpEvidence {
+    ipv4_addresses: HashSet<Ipv4Addr>,
+    ipv6_addresses: HashSet<Ipv6Addr>,
 }
 
-fn parse_ipv6_permanent_map()
--> Result<std::collections::HashMap<(String, Ipv6Addr), bool>, NetworkError> {
+fn parse_lease_addresses(content: &str) -> (HashSet<Ipv4Addr>, HashSet<Ipv6Addr>) {
+    let mut ipv4_addresses = HashSet::new();
+    let mut ipv6_addresses = HashSet::new();
+    for token in content.split(|character: char| {
+        character.is_whitespace() || matches!(character, ';' | ',' | '"' | '\'' | '{' | '}')
+    }) {
+        let token = token.rsplit_once('=').map_or(token, |(_, value)| value);
+        let token = token.split_once('/').map_or(token, |(address, _)| address);
+        if let Ok(address) = token.parse::<IpAddr>() {
+            match address {
+                IpAddr::V4(address) => {
+                    ipv4_addresses.insert(address);
+                }
+                IpAddr::V6(address) => {
+                    ipv6_addresses.insert(address);
+                }
+            }
+        }
+    }
+    (ipv4_addresses, ipv6_addresses)
+}
+
+fn lease_interface(path: &Path, content: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("INTERFACE=")
+                .or_else(|| line.strip_prefix("interface-name:"))
+                .map(|value| value.trim().to_string())
+        })
+        .or_else(|| {
+            let file_name = path.file_name()?.to_str()?;
+            let name = file_name
+                .strip_prefix("dhclient6-")
+                .or_else(|| file_name.strip_prefix("dhclient-"))
+                .or_else(|| file_name.strip_suffix(".lease"))
+                .or_else(|| file_name.strip_suffix(".leases"))?;
+            let name = name
+                .strip_suffix(".lease")
+                .or_else(|| name.strip_suffix(".leases"))
+                .unwrap_or(name);
+            (!name.is_empty()).then(|| name.to_string())
+        })
+}
+
+fn add_linux_lease_evidence(path: &Path, evidence: &mut HashMap<String, LinuxDhcpEvidence>) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Some(interface) = lease_interface(path, &content) else {
+        return;
+    };
+    let (ipv4_addresses, ipv6_addresses) = parse_lease_addresses(&content);
+    if ipv4_addresses.is_empty() && ipv6_addresses.is_empty() {
+        return;
+    }
+    let entry = evidence.entry(interface).or_default();
+    entry.ipv4_addresses.extend(ipv4_addresses);
+    entry.ipv6_addresses.extend(ipv6_addresses);
+}
+
+fn collect_linux_dhcp_evidence() -> HashMap<String, LinuxDhcpEvidence> {
+    let mut evidence = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/run/systemd/netif/leases") {
+        for entry in entries.flatten() {
+            add_linux_lease_evidence(&entry.path(), &mut evidence);
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir("/var/lib/NetworkManager") {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_name.starts_with("dhclient-") || file_name.starts_with("dhclient6-") {
+                add_linux_lease_evidence(&entry.path(), &mut evidence);
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/var/lib/dhcp") {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_name.starts_with("dhclient-") {
+                add_linux_lease_evidence(&entry.path(), &mut evidence);
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/var/lib/dhcpcd") {
+        for entry in entries.flatten() {
+            add_linux_lease_evidence(&entry.path(), &mut evidence);
+        }
+    }
+    evidence
+}
+
+fn parse_ipv6_flags_map() -> Result<HashMap<(String, Ipv6Addr), u32>, NetworkError> {
     const PATH: &str = "/proc/net/if_inet6";
-    let mut map = std::collections::HashMap::new();
+    let mut map = HashMap::new();
     let file = File::open(PATH)
         .map_err(|source| NetworkError::io("read IPv6 interface table", PATH, source))?;
     let reader = BufReader::new(file);
@@ -226,11 +287,156 @@ fn parse_ipv6_permanent_map()
             let flags = u32::from_str_radix(parts[4], 16)
                 .map_err(|_| NetworkError::parse("Linux IPv6 interface flags", parts[4]))?;
             let iface = parts[5].to_string();
-            let is_permanent = (flags & 0x80) != 0;
-            map.insert((iface, ip), is_permanent);
+            map.insert((iface, ip), flags);
         }
     }
     Ok(map)
+}
+
+fn linux_ipv6_allocation(
+    interface: &str,
+    address: Ipv6Addr,
+    flags: Option<u32>,
+    evidence: Option<&LinuxDhcpEvidence>,
+) -> IpAllocation {
+    if interface.starts_with("lo") {
+        return IpAllocation::Other;
+    }
+    if address.is_unicast_link_local() {
+        return IpAllocation::Other;
+    }
+    if evidence.is_some_and(|value| value.ipv6_addresses.contains(&address)) {
+        return IpAllocation::Dhcpv6;
+    }
+
+    const IFA_F_TEMPORARY: u32 = 0x01;
+    const IFA_F_MANAGETEMPADDR: u32 = 0x100;
+    const IFA_F_STABLE_PRIVACY: u32 = 0x800;
+    if flags.is_some_and(|value| {
+        value & (IFA_F_TEMPORARY | IFA_F_MANAGETEMPADDR | IFA_F_STABLE_PRIVACY) != 0
+    }) {
+        IpAllocation::Slaac
+    } else {
+        IpAllocation::Unknown
+    }
+}
+
+fn parse_resolvectl_dns(output: &str) -> Vec<DnsServer> {
+    let mut servers = Vec::new();
+    let mut interface = None;
+    let mut reading_servers = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Global" {
+            interface = None;
+            reading_servers = false;
+        } else if let Some(rest) = trimmed.strip_prefix("Link ") {
+            interface = rest
+                .split_once('(')
+                .and_then(|(_, rest)| rest.strip_suffix(')'))
+                .map(str::to_string);
+            reading_servers = false;
+        } else if let Some(value) = trimmed.strip_prefix("DNS Servers:") {
+            for token in value.split_whitespace() {
+                if let Ok(address) = token.parse::<IpAddr>() {
+                    servers.push(DnsServer {
+                        address,
+                        interface: interface.clone(),
+                        source: DnsSource::SystemdResolved,
+                    });
+                }
+            }
+            reading_servers = true;
+        } else if reading_servers && let Ok(address) = trimmed.parse::<IpAddr>() {
+            servers.push(DnsServer {
+                address,
+                interface: interface.clone(),
+                source: DnsSource::SystemdResolved,
+            });
+        } else if trimmed.starts_with("Current DNS Server:") || trimmed.contains(':') {
+            reading_servers = false;
+        }
+    }
+    servers
+}
+
+fn parse_nmcli_dns(output: &str) -> Vec<DnsServer> {
+    let mut servers = Vec::new();
+    let mut interface = None;
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key == "GENERAL.DEVICE" {
+            interface = (!value.is_empty() && value != "--").then(|| value.to_string());
+        } else if key.starts_with("IP4.DNS") || key.starts_with("IP6.DNS") {
+            let value = value.replace("\\:", ":");
+            if let Ok(address) = value.parse::<IpAddr>() {
+                servers.push(DnsServer {
+                    address,
+                    interface: interface.clone(),
+                    source: DnsSource::NetworkManager,
+                });
+            }
+        }
+    }
+    servers
+}
+
+fn read_linux_dns_file(
+    path: &str,
+    source: DnsSource,
+) -> Result<Option<Vec<DnsServer>>, NetworkError> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_resolv_conf(&contents, source).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source_error) => Err(NetworkError::io(
+            "read DNS configuration",
+            path,
+            source_error,
+        )),
+    }
+}
+
+fn collect_linux_dns() -> DnsConfiguration {
+    if let Ok(output) = Command::new("resolvectl").args(["dns"]).output()
+        && output.status.success()
+    {
+        let servers = parse_resolvectl_dns(&String::from_utf8_lossy(&output.stdout));
+        if !servers.is_empty() {
+            return DnsConfiguration::from_servers(servers);
+        }
+    }
+
+    if let Ok(Some(servers)) = read_linux_dns_file(
+        "/run/systemd/resolve/resolv.conf",
+        DnsSource::SystemdResolved,
+    ) && !servers.is_empty()
+    {
+        return DnsConfiguration::from_servers(servers);
+    }
+
+    if let Ok(output) = Command::new("nmcli")
+        .args([
+            "-t",
+            "-f",
+            "GENERAL.DEVICE,IP4.DNS,IP6.DNS",
+            "device",
+            "show",
+        ])
+        .output()
+        && output.status.success()
+    {
+        let servers = parse_nmcli_dns(&String::from_utf8_lossy(&output.stdout));
+        if !servers.is_empty() {
+            return DnsConfiguration::from_servers(servers);
+        }
+    }
+
+    match read_linux_dns_file("/etc/resolv.conf", DnsSource::ResolvConf) {
+        Ok(Some(servers)) => DnsConfiguration::from_servers(servers),
+        Ok(None) | Err(_) => DnsConfiguration::unavailable(),
+    }
 }
 
 fn empty_linux_interface(name: &str, is_up: bool) -> NetworkInterface {
@@ -249,7 +455,6 @@ fn empty_linux_interface(name: &str, is_up: bool) -> NetworkInterface {
         interface_type: InterfaceType::Unknown,
         allocation: IpAllocation::Unknown,
         link_speed: None,
-        dns_servers: Vec::new(),
         statistics: None,
     }
 }
@@ -258,7 +463,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
     // 1. 获取默认路由及网关列表
     let v4_routes = parse_ipv4_routes()?;
     let v6_routes = parse_ipv6_routes()?;
-    let v6_perm_map = parse_ipv6_permanent_map()?;
+    let v6_flags_map = parse_ipv6_flags_map()?;
+    let dhcp_evidence = collect_linux_dhcp_evidence();
 
     // 2. 调用 getifaddrs
     let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
@@ -269,8 +475,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             .map_or(0, |value| value as u32);
         return Err(NetworkError::api("getifaddrs", code));
     }
-    let mut interface_map: std::collections::HashMap<String, NetworkInterface> =
-        std::collections::HashMap::new();
+    let mut interface_map: HashMap<String, NetworkInterface> = HashMap::new();
 
     let mut current = ifap;
     while !current.is_null() {
@@ -309,13 +514,15 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     prefix_len = mask_u32.count_ones() as u8;
                 }
 
-                let is_dhcp = is_dhcp_interface_linux(&ifa_name);
-                let alloc = if ifa_name == "lo" {
-                    IpAllocation::Static
-                } else if is_dhcp {
-                    IpAllocation::Dynamic
+                let alloc = if ifa_name.starts_with("lo") {
+                    IpAllocation::Other
+                } else if dhcp_evidence
+                    .get(&ifa_name)
+                    .is_some_and(|value| value.ipv4_addresses.contains(&ip))
+                {
+                    IpAllocation::Dhcpv4
                 } else {
-                    IpAllocation::Static
+                    IpAllocation::Unknown
                 };
 
                 let ipv4_info = Ipv4Info {
@@ -341,20 +548,12 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     prefix_len = mask_bytes.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
                 }
 
-                let is_dhcp = is_dhcp_interface_linux(&ifa_name);
-                let alloc = if ifa_name == "lo" {
-                    IpAllocation::Static
-                } else if let Some(&is_perm) = v6_perm_map.get(&(ifa_name.clone(), ip)) {
-                    if is_perm {
-                        IpAllocation::Static
-                    } else {
-                        IpAllocation::Dynamic
-                    }
-                } else if is_dhcp {
-                    IpAllocation::Dynamic
-                } else {
-                    IpAllocation::Static
-                };
+                let alloc = linux_ipv6_allocation(
+                    &ifa_name,
+                    ip,
+                    v6_flags_map.get(&(ifa_name.clone(), ip)).copied(),
+                    dhcp_evidence.get(&ifa_name),
+                );
 
                 let ipv6_info = Ipv6Info {
                     address: ip,
@@ -517,59 +716,33 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             .collect();
         sort_routes(&mut interface.routes);
 
-        // 6. 确定网卡协议栈/IP 分配方式
-        let is_dhcp = is_dhcp_interface_linux(name);
-        let has_dynamic = interface
-            .ipv4_addresses
-            .iter()
-            .any(|a| a.allocation == IpAllocation::Dynamic)
-            || interface
-                .ipv6_addresses
+        // 6. 按地址级证据聚合接口配置来源。
+        interface.allocation = aggregate_allocations(
+            interface
+                .ipv4_addresses
                 .iter()
-                .any(|a| a.allocation == IpAllocation::Dynamic);
-        interface.allocation = if name == "lo" {
-            IpAllocation::Static
-        } else if is_dhcp || has_dynamic {
-            IpAllocation::Dynamic
-        } else if !interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty() {
-            IpAllocation::Static
-        } else {
-            IpAllocation::Unknown
-        };
+                .map(|address| address.allocation)
+                .chain(
+                    interface
+                        .ipv6_addresses
+                        .iter()
+                        .map(|address| address.allocation),
+                ),
+        );
     }
 
     let mut interfaces: Vec<NetworkInterface> = interface_map.into_values().collect();
     sort_interfaces(&mut interfaces);
-    let mut primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
+    let primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
     let other = interfaces;
 
-    // 7. 解析并分配全局 DNS 给主网卡
-    fn parse_dns_servers() -> Result<Vec<IpAddr>, NetworkError> {
-        const PATH: &str = "/etc/resolv.conf";
-        let mut dns = Vec::new();
-        let file = File::open(PATH)
-            .map_err(|source| NetworkError::io("read DNS configuration", PATH, source))?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line =
-                line.map_err(|source| NetworkError::io("read DNS configuration", PATH, source))?;
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[0] == "nameserver" {
-                let ip = parts[1]
-                    .parse::<IpAddr>()
-                    .map_err(|_| NetworkError::parse("Linux DNS nameserver address", parts[1]))?;
-                dns.push(ip);
-            }
-        }
-        Ok(dns)
-    }
+    let dns = collect_linux_dns();
 
-    let dns_list = parse_dns_servers()?;
-    if let Some(ref mut pri) = primary {
-        pri.dns_servers = dns_list;
-    }
-
-    Ok(NetworkInterfaces { primary, other })
+    Ok(NetworkInterfaces {
+        primary,
+        other,
+        dns,
+    })
 }
 
 #[cfg(test)]
@@ -619,5 +792,34 @@ mod tests {
             Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))
         );
         assert_eq!(route.to_route().gateway_scope, Some("eth0".to_string()));
+    }
+
+    #[test]
+    fn parses_dhcp_lease_addresses_by_family() {
+        let (ipv4, ipv6) = parse_lease_addresses(
+            "ADDRESS=192.0.2.10\nfixed-address 192.0.2.10; iaaddr 2001:db8::10/64; option routers 192.0.2.1;",
+        );
+
+        assert!(ipv4.contains(&Ipv4Addr::new(192, 0, 2, 10)));
+        assert!(ipv6.contains(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10)));
+    }
+
+    #[test]
+    fn parses_resolvectl_and_nmcli_interface_sources() {
+        let resolvectl = parse_resolvectl_dns(
+            "Global\n       DNS Servers: 192.0.2.53\nLink 2 (eth0)\n       DNS Servers: 2001:db8::53\n",
+        );
+        assert_eq!(resolvectl.len(), 2);
+        assert!(resolvectl[0].interface.is_none());
+        assert_eq!(resolvectl[1].interface.as_deref(), Some("eth0"));
+
+        let nmcli = parse_nmcli_dns(
+            "GENERAL.DEVICE:eth0\nIP4.DNS[1]:192.0.2.53\nIP6.DNS[1]:2001\\:db8\\:\\:53\n",
+        );
+        assert_eq!(nmcli.len(), 2);
+        assert!(nmcli.iter().all(|server| {
+            server.interface.as_deref() == Some("eth0")
+                && server.source == DnsSource::NetworkManager
+        }));
     }
 }

@@ -212,6 +212,35 @@ fn render_text(interfaces: &shared::NetworkInterfaces, show_all: bool) -> Result
         }
     }
 
+    writeln!(output, "\n[{}]", t!(SystemDns))?;
+    match interfaces.dns.status {
+        shared::DnsStatus::Available => {
+            writeln!(output, " {}:", t!(DnsServers))?;
+            for (index, server) in interfaces.dns.servers.iter().enumerate() {
+                let interface = server
+                    .interface
+                    .as_deref()
+                    .unwrap_or(t!(DnsInterfaceUnknown));
+                writeln!(
+                    output,
+                    "   [{}] {}: {}",
+                    index + 1,
+                    t!(Ipv4AddrLabel, 11),
+                    server.address
+                )?;
+                writeln!(output, "       {}: {}", t!(DnsInterface, 11), interface)?;
+                writeln!(
+                    output,
+                    "       {}: {}",
+                    t!(DnsSource, 11),
+                    i18n::localize_dns_source(server.source)
+                )?;
+            }
+        }
+        shared::DnsStatus::None => writeln!(output, "{}", t!(DnsNoServers))?,
+        shared::DnsStatus::Unavailable => writeln!(output, "{}", t!(DnsUnavailable))?,
+    }
+
     writeln!(
         output,
         "\n=================================================================="
@@ -366,22 +395,7 @@ fn print_interface<W: Write>(face: &shared::NetworkInterface, output: &mut W) ->
         }
     }
 
-    // 9. DNS 服务器配置 (采用树状结构)
-    if !face.dns_servers.is_empty() {
-        writeln!(output, " {}:", t!(DnsServers))?;
-        let len = face.dns_servers.len();
-        for (i, dns) in face.dns_servers.iter().enumerate() {
-            let is_last = i == len - 1;
-            let prefix = if is_last {
-                "   └──"
-            } else {
-                "   ├──"
-            };
-            writeln!(output, "{} {}", prefix, dns)?;
-        }
-    }
-
-    // 10. 网络吞吐流量统计 (采用树状结构)
+    // 9. 网络吞吐流量统计 (采用树状结构)
     if let Some(ref stats) = face.statistics {
         writeln!(output, " {}:", t!(Statistics))?;
         writeln!(

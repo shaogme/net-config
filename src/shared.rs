@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::{fmt, io, path::PathBuf, process::ExitStatus};
 
@@ -25,16 +26,47 @@ pub enum InterfaceType {
     Unknown,
 }
 
-/// IP 地址/协议栈配置分配方式（静态/动态）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
+/// IP 地址的配置来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IpAllocation {
-    /// 动态分配 (DHCP / SLAAC)
-    Dynamic,
-    /// 静态分配 (手动指定)
-    Static,
-    /// 未知
+    /// 手动配置的地址。
+    Manual,
+    /// DHCPv4 分配的地址。
+    Dhcpv4,
+    /// DHCPv6 分配的地址。
+    Dhcpv6,
+    /// 路由器通告提供的前缀或地址来源。
+    RouterAdvertisement,
+    /// 由 SLAAC 生成的地址。
+    Slaac,
+    /// 平台明确报告但无法映射到上述来源的地址。
+    Other,
+    /// 没有足够证据判断来源。
     Unknown,
+    /// 同一接口上的地址使用了多个来源，或同时存在已知和未知来源。
+    Mixed,
+}
+
+/// 根据地址级结果聚合接口级配置来源。
+///
+/// 空地址列表和只有未知来源的地址都返回 `Unknown`。只有所有地址来源完全
+/// 相同才返回该来源；任何来源差异（包括已知来源与未知来源并存）都返回
+/// `Mixed`，避免把部分证据误报成整个接口的单一配置方式。
+pub fn aggregate_allocations<I>(allocations: I) -> IpAllocation
+where
+    I: IntoIterator<Item = IpAllocation>,
+{
+    let unique: BTreeSet<IpAllocation> = allocations.into_iter().collect();
+    match unique.len() {
+        0 => IpAllocation::Unknown,
+        1 => unique
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(IpAllocation::Unknown),
+        _ => IpAllocation::Mixed,
+    }
 }
 
 /// 路由使用的地址族
@@ -185,6 +217,100 @@ pub struct NetworkInterfaces {
     pub primary: Option<NetworkInterface>,
     /// 其他网卡列表
     pub other: Vec<NetworkInterface>,
+    /// 系统级 DNS 解析配置，不属于某一个主网卡。
+    pub dns: DnsConfiguration,
+}
+
+/// DNS 配置的采集状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsStatus {
+    /// 至少采集到一个 DNS 服务器。
+    Available,
+    /// 权威来源可访问，但没有配置 DNS 服务器。
+    None,
+    /// 当前环境无法读取任何 DNS 配置来源。
+    Unavailable,
+}
+
+/// 系统级 DNS 解析配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsConfiguration {
+    pub status: DnsStatus,
+    pub servers: Vec<DnsServer>,
+}
+
+impl DnsConfiguration {
+    pub fn from_servers(mut servers: Vec<DnsServer>) -> Self {
+        sort_dns_servers(&mut servers);
+        servers.dedup();
+        let status = if servers.is_empty() {
+            DnsStatus::None
+        } else {
+            DnsStatus::Available
+        };
+        Self { status, servers }
+    }
+
+    #[allow(dead_code)]
+    pub fn unavailable() -> Self {
+        Self {
+            status: DnsStatus::Unavailable,
+            servers: Vec::new(),
+        }
+    }
+}
+
+/// DNS 服务器及其可选的接口归属和采集来源。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsServer {
+    pub address: IpAddr,
+    pub interface: Option<String>,
+    pub source: DnsSource,
+}
+
+/// DNS 配置来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsSource {
+    SystemdResolved,
+    NetworkManager,
+    ResolvConf,
+    Scutil,
+    WindowsAdapter,
+}
+
+/// 解析 resolv.conf 风格文本中的 nameserver 行。
+#[allow(dead_code)]
+pub fn parse_resolv_conf(
+    contents: &str,
+    source: DnsSource,
+) -> Result<Vec<DnsServer>, NetworkError> {
+    let mut servers = Vec::new();
+    for line in contents.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 && parts[0] == "nameserver" {
+            let address = parts[1]
+                .parse::<IpAddr>()
+                .map_err(|_| NetworkError::parse("DNS nameserver address", parts[1]))?;
+            servers.push(DnsServer {
+                address,
+                interface: None,
+                source,
+            });
+        }
+    }
+    Ok(servers)
+}
+
+/// 按接口、来源和地址稳定排序 DNS 服务器。
+pub fn sort_dns_servers(servers: &mut [DnsServer]) {
+    servers.sort_by(|left, right| {
+        left.interface
+            .cmp(&right.interface)
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.address.cmp(&right.address))
+    });
 }
 
 /// 网卡（网络接口）信息
@@ -206,12 +332,10 @@ pub struct NetworkInterface {
     pub status: InterfaceStatus,
     /// 接口类型
     pub interface_type: InterfaceType,
-    /// 协议栈/IP 地址分配模式（静态/动态/未知）
+    /// 由所有地址级来源聚合得到的接口级配置来源。
     pub allocation: IpAllocation,
     /// 链路速度（单位：bps，例如 1000000000 表示 1 Gbps，None 表示未知或不可用）
     pub link_speed: Option<u64>,
-    /// DNS 服务器列表
-    pub dns_servers: Vec<IpAddr>,
     /// 流量统计数据（发送/接收字节数等）
     pub statistics: Option<InterfaceStats>,
 }
@@ -225,7 +349,7 @@ pub struct Ipv4Info {
     pub netmask: Ipv4Addr,
     /// 前缀长度（如 24）
     pub prefix_len: u8,
-    /// IP 分配方式（动态/静态/未知）
+    /// IP 地址的配置来源。
     pub allocation: IpAllocation,
 }
 
@@ -236,7 +360,7 @@ pub struct Ipv6Info {
     pub address: Ipv6Addr,
     /// 前缀长度（如 64）
     pub prefix_len: u8,
-    /// IP 分配方式（动态/静态/未知）
+    /// IP 地址的配置来源。
     pub allocation: IpAllocation,
 }
 
@@ -461,7 +585,6 @@ mod tests {
             interface_type,
             allocation: IpAllocation::Unknown,
             link_speed: None,
-            dns_servers: Vec::new(),
             statistics: None,
         }
     }
@@ -604,5 +727,39 @@ mod tests {
         ];
 
         assert_eq!(select_primary_interface(&interfaces), Some(0));
+    }
+
+    #[test]
+    fn allocation_aggregation_preserves_mixed_sources() {
+        assert_eq!(
+            aggregate_allocations([IpAllocation::Dhcpv4, IpAllocation::Dhcpv4]),
+            IpAllocation::Dhcpv4
+        );
+        assert_eq!(
+            aggregate_allocations([IpAllocation::Dhcpv4, IpAllocation::Manual]),
+            IpAllocation::Mixed
+        );
+        assert_eq!(
+            aggregate_allocations([IpAllocation::Dhcpv4, IpAllocation::Unknown]),
+            IpAllocation::Mixed
+        );
+        assert_eq!(aggregate_allocations([]), IpAllocation::Unknown);
+    }
+
+    #[test]
+    fn parses_dns_without_assigning_an_interface() {
+        let servers = parse_resolv_conf(
+            "nameserver 192.0.2.53\nnameserver 2001:db8::53\n",
+            DnsSource::ResolvConf,
+        )
+        .expect("DNS configuration should parse");
+
+        assert_eq!(servers.len(), 2);
+        assert!(servers.iter().all(|server| server.interface.is_none()));
+        assert!(
+            servers
+                .iter()
+                .all(|server| server.source == DnsSource::ResolvConf)
+        );
     }
 }

@@ -1,28 +1,116 @@
 use crate::shared::{
-    AddressFamily, InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info,
-    Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route, select_primary_interface,
+    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceStats, InterfaceStatus,
+    InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface,
+    NetworkInterfaces, Route, aggregate_allocations, parse_resolv_conf, select_primary_interface,
     sort_interfaces, sort_routes,
 };
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::process::Command;
 use std::ptr;
 
-fn check_is_dhcp_macos(iface: &str) -> Result<bool, NetworkError> {
-    if iface.starts_with("lo") {
-        return Ok(false);
-    }
-    let output = std::process::Command::new("ipconfig")
-        .args(["getpacket", iface])
-        .output()
-        .map_err(|source| NetworkError::command_spawn("ipconfig", &["getpacket", iface], source))?;
-    if output.status.success() && !output.stdout.is_empty() {
-        let s = String::from_utf8_lossy(&output.stdout);
-        if s.contains("op =") || s.contains("yiaddr") || s.contains("server_identifier") {
-            return Ok(true);
+#[derive(Debug, Default)]
+struct MacosAllocationEvidence {
+    dhcpv4_addresses: HashSet<Ipv4Addr>,
+    dhcpv6_addresses: HashSet<Ipv6Addr>,
+    slaac_addresses: HashSet<Ipv6Addr>,
+}
+
+fn parse_macos_dhcp_addresses(output: &str, ipv6: bool) -> HashSet<IpAddr> {
+    let mut addresses = HashSet::new();
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_lowercase();
+        let is_address = if ipv6 {
+            key.contains("iaaddr") || key.contains("ia address") || key == "address"
+        } else {
+            key == "yiaddr"
+        };
+        if !is_address {
+            continue;
+        }
+        let value = value
+            .trim()
+            .trim_matches(|character: char| matches!(character, ';' | ',' | '"' | '\''));
+        if ipv6 {
+            if let Some((address, _)) = parse_scoped_ipv6(value) {
+                addresses.insert(IpAddr::V6(address));
+            }
+        } else if let Ok(address) = value.parse::<Ipv4Addr>() {
+            addresses.insert(IpAddr::V4(address));
         }
     }
-    Ok(false)
+    addresses
+}
+
+fn probe_macos_dhcp(iface: &str, ipv6: bool) -> HashSet<IpAddr> {
+    let args = if ipv6 {
+        ["getv6packet", iface]
+    } else {
+        ["getpacket", iface]
+    };
+    let Ok(output) = Command::new("ipconfig").args(args).output() else {
+        return HashSet::new();
+    };
+    if !output.status.success() || output.stdout.is_empty() {
+        return HashSet::new();
+    }
+    parse_macos_dhcp_addresses(&String::from_utf8_lossy(&output.stdout), ipv6)
+}
+
+fn parse_macos_slaac_addresses(output: &str) -> HashSet<Ipv6Addr> {
+    let mut addresses = HashSet::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 || parts[0] != "inet6" {
+            continue;
+        }
+        let address = parts[1]
+            .split_once('%')
+            .map_or(parts[1], |(address, _)| address);
+        if let Ok(address) = address.parse::<Ipv6Addr>()
+            && parts
+                .iter()
+                .any(|part| *part == "autoconf" || *part == "temporary")
+        {
+            addresses.insert(address);
+        }
+    }
+    addresses
+}
+
+fn collect_macos_allocation_evidence(iface: &str) -> MacosAllocationEvidence {
+    if iface.starts_with("lo") {
+        return MacosAllocationEvidence::default();
+    }
+    let slaac_addresses = Command::new("ifconfig")
+        .arg(iface)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_macos_slaac_addresses(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default();
+    let dhcpv4_addresses = probe_macos_dhcp(iface, false)
+        .into_iter()
+        .filter_map(|address| match address {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    let dhcpv6_addresses = probe_macos_dhcp(iface, true)
+        .into_iter()
+        .filter_map(|address| match address {
+            IpAddr::V4(_) => None,
+            IpAddr::V6(address) => Some(address),
+        })
+        .collect();
+    MacosAllocationEvidence {
+        dhcpv4_addresses,
+        dhcpv6_addresses,
+        slaac_addresses,
+    }
 }
 
 fn parse_ipv4_destination(value: &str, flags: &str) -> Option<(Ipv4Addr, u8)> {
@@ -329,25 +417,58 @@ fn get_macos_interface_types()
     Ok(types)
 }
 
-/// 解析全局 DNS 配置
-fn parse_dns_servers() -> Result<Vec<IpAddr>, NetworkError> {
-    const PATH: &str = "/etc/resolv.conf";
-    let mut dns = Vec::new();
-    let file = File::open(PATH)
-        .map_err(|source| NetworkError::io("read DNS configuration", PATH, source))?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line =
-            line.map_err(|source| NetworkError::io("read DNS configuration", PATH, source))?;
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 && parts[0] == "nameserver" {
-            let ip = parts[1]
-                .parse::<IpAddr>()
-                .map_err(|_| NetworkError::parse("macOS DNS nameserver address", parts[1]))?;
-            dns.push(ip);
+fn parse_scutil_dns(output: &str) -> Vec<DnsServer> {
+    let mut servers = Vec::new();
+    let mut resolver_interface = None;
+    let mut resolver_servers = Vec::new();
+
+    let flush_resolver = |servers: &mut Vec<DnsServer>,
+                          resolver_interface: &Option<String>,
+                          resolver_servers: &mut Vec<IpAddr>| {
+        servers.extend(resolver_servers.drain(..).map(|address| DnsServer {
+            address,
+            interface: resolver_interface.clone(),
+            source: DnsSource::Scutil,
+        }));
+    };
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("resolver #") {
+            flush_resolver(&mut servers, &resolver_interface, &mut resolver_servers);
+            resolver_interface = None;
+        } else if let Some(value) = trimmed.strip_prefix("nameserver[")
+            && let Some((_, value)) = value.split_once(':')
+            && let Ok(address) = value.trim().parse::<IpAddr>()
+        {
+            resolver_servers.push(address);
+        } else if let Some(value) = trimmed.strip_prefix("if_index")
+            && let Some((_, interface)) = value.trim().split_once('(')
+        {
+            resolver_interface = interface.strip_suffix(')').map(str::to_string);
         }
     }
-    Ok(dns)
+    flush_resolver(&mut servers, &resolver_interface, &mut resolver_servers);
+    servers
+}
+
+fn collect_macos_dns() -> DnsConfiguration {
+    if let Ok(output) = Command::new("scutil").args(["--dns"]).output()
+        && output.status.success()
+    {
+        let servers = parse_scutil_dns(&String::from_utf8_lossy(&output.stdout));
+        if !servers.is_empty() {
+            return DnsConfiguration::from_servers(servers);
+        }
+    }
+
+    match std::fs::read_to_string("/etc/resolv.conf") {
+        Ok(contents) => match parse_resolv_conf(&contents, DnsSource::ResolvConf) {
+            Ok(servers) => DnsConfiguration::from_servers(servers),
+            Err(_) => DnsConfiguration::unavailable(),
+        },
+        Err(_) => DnsConfiguration::unavailable(),
+    }
 }
 
 /// macOS 下获取所有网卡信息的统一实现
@@ -381,8 +502,8 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             .map_or(0, |value| value as u32);
         return Err(NetworkError::api("getifaddrs", code));
     }
-    let mut interface_map: std::collections::HashMap<String, NetworkInterface> =
-        std::collections::HashMap::new();
+    let mut interface_map: HashMap<String, NetworkInterface> = HashMap::new();
+    let mut allocation_evidence: HashMap<String, MacosAllocationEvidence> = HashMap::new();
 
     let mut current = ifap;
     while !current.is_null() {
@@ -415,19 +536,15 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     prefix_len = mask_u32.count_ones() as u8;
                 }
 
-                let is_dhcp = match check_is_dhcp_macos(&ifa_name) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        unsafe { libc::freeifaddrs(ifap) };
-                        return Err(error);
-                    }
-                };
+                let evidence = allocation_evidence
+                    .entry(ifa_name.clone())
+                    .or_insert_with(|| collect_macos_allocation_evidence(&ifa_name));
                 let alloc = if ifa_name.starts_with("lo") {
-                    IpAllocation::Static
-                } else if is_dhcp {
-                    IpAllocation::Dynamic
+                    IpAllocation::Other
+                } else if evidence.dhcpv4_addresses.contains(&ip) {
+                    IpAllocation::Dhcpv4
                 } else {
-                    IpAllocation::Static
+                    IpAllocation::Unknown
                 };
 
                 let ipv4_info = Ipv4Info {
@@ -456,7 +573,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                             interface_type: InterfaceType::Unknown,
                             allocation: IpAllocation::Unknown,
                             link_speed: None,
-                            dns_servers: Vec::new(),
                             statistics: None,
                         });
                 entry.ipv4_addresses.push(ipv4_info);
@@ -472,19 +588,19 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     prefix_len = mask_bytes.iter().map(|b| b.count_ones()).sum::<u32>() as u8;
                 }
 
-                let is_dhcp = match check_is_dhcp_macos(&ifa_name) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        unsafe { libc::freeifaddrs(ifap) };
-                        return Err(error);
-                    }
-                };
+                let evidence = allocation_evidence
+                    .entry(ifa_name.clone())
+                    .or_insert_with(|| collect_macos_allocation_evidence(&ifa_name));
                 let alloc = if ifa_name.starts_with("lo") {
-                    IpAllocation::Static
-                } else if is_dhcp {
-                    IpAllocation::Dynamic
+                    IpAllocation::Other
+                } else if ip.is_unicast_link_local() {
+                    IpAllocation::Other
+                } else if evidence.dhcpv6_addresses.contains(&ip) {
+                    IpAllocation::Dhcpv6
+                } else if evidence.slaac_addresses.contains(&ip) {
+                    IpAllocation::Slaac
                 } else {
-                    IpAllocation::Static
+                    IpAllocation::Unknown
                 };
 
                 let ipv6_info = Ipv6Info {
@@ -512,7 +628,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                             interface_type: InterfaceType::Unknown,
                             allocation: IpAllocation::Unknown,
                             link_speed: None,
-                            dns_servers: Vec::new(),
                             statistics: None,
                         });
                 entry.ipv6_addresses.push(ipv6_info);
@@ -577,7 +692,6 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                             interface_type: InterfaceType::Unknown,
                             allocation: IpAllocation::Unknown,
                             link_speed: None,
-                            dns_servers: Vec::new(),
                             statistics: None,
                         });
 
@@ -631,38 +745,32 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             .collect();
         sort_routes(&mut interface.routes);
 
-        let is_dhcp = check_is_dhcp_macos(name)?;
-        let has_dynamic = interface
-            .ipv4_addresses
-            .iter()
-            .any(|a| a.allocation == IpAllocation::Dynamic)
-            || interface
-                .ipv6_addresses
+        interface.allocation = aggregate_allocations(
+            interface
+                .ipv4_addresses
                 .iter()
-                .any(|a| a.allocation == IpAllocation::Dynamic);
-        interface.allocation = if name.starts_with("lo") {
-            IpAllocation::Static
-        } else if is_dhcp || has_dynamic {
-            IpAllocation::Dynamic
-        } else if !interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty() {
-            IpAllocation::Static
-        } else {
-            IpAllocation::Unknown
-        };
+                .map(|address| address.allocation)
+                .chain(
+                    interface
+                        .ipv6_addresses
+                        .iter()
+                        .map(|address| address.allocation),
+                ),
+        );
     }
 
     let mut interfaces: Vec<NetworkInterface> = interface_map.into_values().collect();
     sort_interfaces(&mut interfaces);
-    let mut primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
+    let primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
     let other = interfaces;
 
-    // 5. 分配全局 DNS 信息给主网卡
-    let dns_list = parse_dns_servers()?;
-    if let Some(ref mut pri) = primary {
-        pri.dns_servers = dns_list;
-    }
+    let dns = collect_macos_dns();
 
-    Ok(NetworkInterfaces { primary, other })
+    Ok(NetworkInterfaces {
+        primary,
+        other,
+        dns,
+    })
 }
 
 #[cfg(test)]
@@ -717,5 +825,42 @@ mod tests {
             Some(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)))
         );
         assert_eq!(routes[0].gateway_scope, Some("en0".to_string()));
+    }
+
+    #[test]
+    fn parses_scutil_dns_resolver_interface() {
+        let servers = parse_scutil_dns(
+            "DNS configuration\nresolver #1\n  nameserver[0] : 192.0.2.53\n  if_index : 4 (en0)\nresolver #2\n  nameserver[0] : 2001:db8::53\n",
+        );
+
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].interface.as_deref(), Some("en0"));
+        assert_eq!(servers[1].interface, None);
+        assert!(
+            servers
+                .iter()
+                .all(|server| server.source == DnsSource::Scutil)
+        );
+    }
+
+    #[test]
+    fn parses_macos_slaac_flags_by_address() {
+        let addresses = parse_macos_slaac_addresses(
+            "en0: flags=8863<UP>\n\tinet6 2001:db8::10 prefixlen 64 autoconf secured\n\tinet6 fe80::1%en0 prefixlen 64 scopeid 0x4\n",
+        );
+
+        assert!(addresses.contains(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10)));
+        assert!(!addresses.contains(&Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn parses_macos_dhcp_lease_address_only() {
+        let addresses = parse_macos_dhcp_addresses(
+            "op = BOOTREPLY\nyiaddr = 192.0.2.10\nserver_identifier = 192.0.2.1\n",
+            false,
+        );
+
+        assert_eq!(addresses.len(), 1);
+        assert!(addresses.contains(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))));
     }
 }

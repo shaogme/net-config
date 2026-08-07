@@ -1,3 +1,4 @@
+use crate::shared::{DnsSource, IpAllocation};
 use std::sync::OnceLock;
 
 pub mod detection;
@@ -63,6 +64,12 @@ pub enum Text {
     Ipv4Config,
     Ipv6Config,
     DnsServers,
+    SystemDns,
+    DnsNoServers,
+    DnsUnavailable,
+    DnsInterface,
+    DnsInterfaceUnknown,
+    DnsSource,
     Statistics,
     RxStats,
     TxStats,
@@ -120,6 +127,12 @@ impl Text {
                 Text::Ipv4Config => "IPv4 配置",
                 Text::Ipv6Config => "IPv6 配置",
                 Text::DnsServers => "DNS 服务器",
+                Text::SystemDns => "系统 DNS",
+                Text::DnsNoServers => "  (没有配置 DNS 服务器)",
+                Text::DnsUnavailable => "  (DNS 配置不可用或未采集)",
+                Text::DnsInterface => "接口",
+                Text::DnsInterfaceUnknown => "系统级/未知接口",
+                Text::DnsSource => "来源",
                 Text::Statistics => "吞吐流量统计",
                 Text::RxStats => "接收 (Rx)",
                 Text::TxStats => "发送 (Tx)",
@@ -180,6 +193,12 @@ impl Text {
                 Text::Ipv4Config => "IPv4 Config",
                 Text::Ipv6Config => "IPv6 Config",
                 Text::DnsServers => "DNS Servers",
+                Text::SystemDns => "System DNS",
+                Text::DnsNoServers => "  (No DNS servers configured)",
+                Text::DnsUnavailable => "  (DNS configuration unavailable or not collected)",
+                Text::DnsInterface => "Interface",
+                Text::DnsInterfaceUnknown => "System-wide / Unknown interface",
+                Text::DnsSource => "Source",
                 Text::Statistics => "Statistics",
                 Text::RxStats => "Received (Rx)",
                 Text::TxStats => "Transmitted (Tx)",
@@ -299,17 +318,47 @@ pub fn localize_type(itype: crate::shared::InterfaceType) -> &'static str {
 }
 
 /// IP 分配方式的本地化封装
-pub fn localize_allocation(alloc: crate::shared::IpAllocation) -> &'static str {
+pub fn localize_allocation(alloc: IpAllocation) -> &'static str {
     match current() {
         Language::Zh => match alloc {
-            crate::shared::IpAllocation::Dynamic => "动态分配 (DHCP)",
-            crate::shared::IpAllocation::Static => "静态分配 (Static)",
-            crate::shared::IpAllocation::Unknown => "未知 (Unknown)",
+            IpAllocation::Manual => "手动配置 (Manual)",
+            IpAllocation::Dhcpv4 => "DHCPv4",
+            IpAllocation::Dhcpv6 => "DHCPv6",
+            IpAllocation::RouterAdvertisement => "路由器通告 (RA)",
+            IpAllocation::Slaac => "无状态地址自动配置 (SLAAC)",
+            IpAllocation::Other => "其他来源 (Other)",
+            IpAllocation::Unknown => "未知 (Unknown)",
+            IpAllocation::Mixed => "混合来源 (Mixed)",
         },
         Language::En => match alloc {
-            crate::shared::IpAllocation::Dynamic => "Dynamic (DHCP)",
-            crate::shared::IpAllocation::Static => "Static",
-            crate::shared::IpAllocation::Unknown => "Unknown",
+            IpAllocation::Manual => "Manual",
+            IpAllocation::Dhcpv4 => "DHCPv4",
+            IpAllocation::Dhcpv6 => "DHCPv6",
+            IpAllocation::RouterAdvertisement => "Router Advertisement (RA)",
+            IpAllocation::Slaac => "SLAAC",
+            IpAllocation::Other => "Other",
+            IpAllocation::Unknown => "Unknown",
+            IpAllocation::Mixed => "Mixed",
+        },
+    }
+}
+
+/// DNS 采集来源的本地化封装。
+pub fn localize_dns_source(source: DnsSource) -> &'static str {
+    match current() {
+        Language::Zh => match source {
+            DnsSource::SystemdResolved => "systemd-resolved",
+            DnsSource::NetworkManager => "NetworkManager",
+            DnsSource::ResolvConf => "resolv.conf 回退",
+            DnsSource::Scutil => "scutil",
+            DnsSource::WindowsAdapter => "Windows 适配器",
+        },
+        Language::En => match source {
+            DnsSource::SystemdResolved => "systemd-resolved",
+            DnsSource::NetworkManager => "NetworkManager",
+            DnsSource::ResolvConf => "resolv.conf fallback",
+            DnsSource::Scutil => "scutil",
+            DnsSource::WindowsAdapter => "Windows adapter",
         },
     }
 }
