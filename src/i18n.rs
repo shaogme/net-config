@@ -1,4 +1,6 @@
+use crate::shared::{DnsSource, IpAllocation};
 use std::sync::OnceLock;
+use unicode_width::UnicodeWidthStr;
 
 pub mod detection;
 
@@ -15,6 +17,25 @@ impl Language {
         match s.to_lowercase().as_str() {
             "zh" | "zh-cn" | "zh_cn" | "chinese" => Some(Language::Zh),
             "en" | "en-us" | "en_us" | "english" => Some(Language::En),
+            _ => None,
+        }
+    }
+
+    /// 从 POSIX/Windows 区域语言环境值解析语言。
+    pub(crate) fn from_locale(value: &str) -> Option<Self> {
+        if let Some(language) = Self::from_str(value) {
+            return Some(language);
+        }
+        let language = value
+            .split(['.', '@'])
+            .next()
+            .unwrap_or(value)
+            .split(['-', '_'])
+            .next()
+            .unwrap_or(value);
+        match language.to_lowercase().as_str() {
+            "zh" => Some(Self::Zh),
+            "en" => Some(Self::En),
             _ => None,
         }
     }
@@ -38,8 +59,10 @@ pub fn current() -> Language {
 pub enum Text {
     ProgramTitle,
     UnknownArg,
+    UnsupportedLanguage,
     JsonError,
     FetchInterfaceError,
+    OutputError,
     PrimaryInterfaceHeader,
     NoPrimaryInterface,
     OtherInterfaceHeader,
@@ -61,6 +84,12 @@ pub enum Text {
     Ipv4Config,
     Ipv6Config,
     DnsServers,
+    SystemDns,
+    DnsNoServers,
+    DnsUnavailable,
+    DnsInterface,
+    DnsInterfaceUnknown,
+    DnsSource,
     Statistics,
     RxStats,
     TxStats,
@@ -71,15 +100,19 @@ pub enum Text {
     // 排版对齐专用标签
     Ipv4AddrLabel,
     Ipv4MaskLabel,
-    Ipv4GatewayLabel,
-    Ipv4GatewayNone,
     Ipv4AllocLabel,
     Ipv6AddrLabel,
     Ipv6PrefixLabel,
-    Ipv6GatewayLabel,
-    Ipv6GatewayNone,
     Ipv6AllocLabel,
     Ipv4PrefixSuffix,
+    Routes,
+    RouteDestination,
+    RouteGateway,
+    RouteGatewayNone,
+    RouteInterface,
+    RouteMetric,
+    RouteMetricUnknown,
+    RouteDefault,
 }
 
 impl Text {
@@ -89,8 +122,10 @@ impl Text {
             Language::Zh => match self {
                 Text::ProgramTitle => "NetConfig - 跨平台网络接口拓扑分析工具",
                 Text::UnknownArg => "错误: 未知的命令行参数",
+                Text::UnsupportedLanguage => "错误：不支持的语言",
                 Text::JsonError => "错误：序列化 JSON 失败",
                 Text::FetchInterfaceError => "错误：获取网卡信息失败",
+                Text::OutputError => "错误：输出失败",
                 Text::PrimaryInterfaceHeader => "主网卡 (Primary Interface)",
                 Text::NoPrimaryInterface => "  (未检测到主网卡，可能无互联网连接)",
                 Text::OtherInterfaceHeader => "其他网卡 (Other Interfaces)",
@@ -112,6 +147,12 @@ impl Text {
                 Text::Ipv4Config => "IPv4 配置",
                 Text::Ipv6Config => "IPv6 配置",
                 Text::DnsServers => "DNS 服务器",
+                Text::SystemDns => "系统 DNS",
+                Text::DnsNoServers => "  (没有配置 DNS 服务器)",
+                Text::DnsUnavailable => "  (DNS 配置不可用或未采集)",
+                Text::DnsInterface => "接口",
+                Text::DnsInterfaceUnknown => "系统级/未知接口",
+                Text::DnsSource => "来源",
                 Text::Statistics => "吞吐流量统计",
                 Text::RxStats => "接收 (Rx)",
                 Text::TxStats => "发送 (Tx)",
@@ -122,21 +163,27 @@ impl Text {
                 // 排版对齐专用标签
                 Text::Ipv4AddrLabel => "地址",
                 Text::Ipv4MaskLabel => "子网掩码",
-                Text::Ipv4GatewayLabel => "默认网关",
-                Text::Ipv4GatewayNone => "无",
                 Text::Ipv4AllocLabel => "分配方式",
                 Text::Ipv6AddrLabel => "地址",
                 Text::Ipv6PrefixLabel => "前缀长度",
-                Text::Ipv6GatewayLabel => "默认网关",
-                Text::Ipv6GatewayNone => "无",
                 Text::Ipv6AllocLabel => "分配方式",
                 Text::Ipv4PrefixSuffix => "前缀",
+                Text::Routes => "路由",
+                Text::RouteDestination => "目的网络",
+                Text::RouteGateway => "下一跳",
+                Text::RouteGatewayNone => "直连/无",
+                Text::RouteInterface => "接口",
+                Text::RouteMetric => "Metric",
+                Text::RouteMetricUnknown => "未知",
+                Text::RouteDefault => "默认路由",
             },
             Language::En => match self {
                 Text::ProgramTitle => "NetConfig - Cross-Platform Network Interface Topology Tool",
                 Text::UnknownArg => "Error: Unknown command-line argument",
+                Text::UnsupportedLanguage => "Error: Unsupported language",
                 Text::JsonError => "Error: Failed to serialize JSON",
                 Text::FetchInterfaceError => "Error: Failed to get network interfaces",
+                Text::OutputError => "Error: Failed to write output",
                 Text::PrimaryInterfaceHeader => "Primary Interface",
                 Text::NoPrimaryInterface => {
                     "  (No primary interface detected, possibly no internet connection)"
@@ -166,6 +213,12 @@ impl Text {
                 Text::Ipv4Config => "IPv4 Config",
                 Text::Ipv6Config => "IPv6 Config",
                 Text::DnsServers => "DNS Servers",
+                Text::SystemDns => "System DNS",
+                Text::DnsNoServers => "  (No DNS servers configured)",
+                Text::DnsUnavailable => "  (DNS configuration unavailable or not collected)",
+                Text::DnsInterface => "Interface",
+                Text::DnsInterfaceUnknown => "System-wide / Unknown interface",
+                Text::DnsSource => "Source",
                 Text::Statistics => "Statistics",
                 Text::RxStats => "Received (Rx)",
                 Text::TxStats => "Transmitted (Tx)",
@@ -176,44 +229,28 @@ impl Text {
                 // 排版对齐专用标签
                 Text::Ipv4AddrLabel => "Address",
                 Text::Ipv4MaskLabel => "Subnet Mask",
-                Text::Ipv4GatewayLabel => "Gateway",
-                Text::Ipv4GatewayNone => "None",
                 Text::Ipv4AllocLabel => "Allocation",
                 Text::Ipv6AddrLabel => "Address",
                 Text::Ipv6PrefixLabel => "Prefix Len",
-                Text::Ipv6GatewayLabel => "Gateway",
-                Text::Ipv6GatewayNone => "None",
                 Text::Ipv6AllocLabel => "Allocation",
                 Text::Ipv4PrefixSuffix => "Prefix",
+                Text::Routes => "Routes",
+                Text::RouteDestination => "Destination",
+                Text::RouteGateway => "Gateway",
+                Text::RouteGatewayNone => "On-link / None",
+                Text::RouteInterface => "Interface",
+                Text::RouteMetric => "Metric",
+                Text::RouteMetricUnknown => "Unknown",
+                Text::RouteDefault => "Default",
             },
         }
     }
 }
 
-/// 判断字符是否为东亚宽字符（终端占 2 格）
-fn is_full_width(c: char) -> bool {
-    let cp = c as u32;
-    if cp < 0x80 {
-        return false; // ASCII 字符均为窄字符（1格）
-    }
-    // CJK 统一表意文字及符号范围
-    (0x4E00..=0x9FFF).contains(&cp) || // CJK 统一汉字
-    (0x3000..=0x303F).contains(&cp) || // CJK 标点符号（如实心句号、逗号、全角空格等）
-    (0xFF00..=0xFFEF).contains(&cp) || // 全角英文字母、数字及全角标点符号
-    (0x1100..=0x115F).contains(&cp) || // 谚文母音
-    (0x2E80..=0x3000).contains(&cp) || // CJK 部首及辅助字符
-    (0x3400..=0x4DBF).contains(&cp) || // CJK 扩展 A
-    (0xAC00..=0xD7A3).contains(&cp) || // 谚文音节 (韩文)
-    (0xF900..=0xFAFF).contains(&cp) || // CJK 兼容表意文字
-    (0xFE30..=0xFE4F).contains(&cp) || // CJK 兼容形式
-    (0x20000..=0x3FFFD).contains(&cp) // CJK 扩展 B-G
-}
-
 /// 计算字符串在终端中的真实显示列宽
 pub fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| if is_full_width(c) { 2 } else { 1 })
-        .sum()
+    // 未知终端类型时采用 Unicode 的非 CJK 规则：Ambiguous 字符宽度为 1。
+    UnicodeWidthStr::width(s)
 }
 
 /// 将字符串向右填充空格到指定的终端列宽
@@ -242,16 +279,16 @@ macro_rules! t {
 pub fn localize_status(status: crate::shared::InterfaceStatus) -> &'static str {
     match current() {
         Language::Zh => match status {
-            crate::shared::InterfaceStatus::Up => "🟢 已启用 (Up)",
-            crate::shared::InterfaceStatus::Down => "🔴 未启用 (Down)",
-            crate::shared::InterfaceStatus::Testing => "🟡 测试中 (Testing)",
-            crate::shared::InterfaceStatus::Unknown => "⚪ 未知 (Unknown)",
+            crate::shared::InterfaceStatus::Up => "已启用 (Up)",
+            crate::shared::InterfaceStatus::Down => "未启用 (Down)",
+            crate::shared::InterfaceStatus::Testing => "测试中 (Testing)",
+            crate::shared::InterfaceStatus::Unknown => "未知 (Unknown)",
         },
         Language::En => match status {
-            crate::shared::InterfaceStatus::Up => "🟢 Up",
-            crate::shared::InterfaceStatus::Down => "🔴 Down",
-            crate::shared::InterfaceStatus::Testing => "🟡 Testing",
-            crate::shared::InterfaceStatus::Unknown => "⚪ Unknown",
+            crate::shared::InterfaceStatus::Up => "Up",
+            crate::shared::InterfaceStatus::Down => "Down",
+            crate::shared::InterfaceStatus::Testing => "Testing",
+            crate::shared::InterfaceStatus::Unknown => "Unknown",
         },
     }
 }
@@ -281,17 +318,68 @@ pub fn localize_type(itype: crate::shared::InterfaceType) -> &'static str {
 }
 
 /// IP 分配方式的本地化封装
-pub fn localize_allocation(alloc: crate::shared::IpAllocation) -> &'static str {
+pub fn localize_allocation(alloc: IpAllocation) -> &'static str {
     match current() {
         Language::Zh => match alloc {
-            crate::shared::IpAllocation::Dynamic => "动态分配 (DHCP)",
-            crate::shared::IpAllocation::Static => "静态分配 (Static)",
-            crate::shared::IpAllocation::Unknown => "未知 (Unknown)",
+            IpAllocation::Manual => "手动配置 (Manual)",
+            IpAllocation::Dhcpv4 => "DHCPv4",
+            IpAllocation::Dhcpv6 => "DHCPv6",
+            IpAllocation::RouterAdvertisement => "路由器通告 (RA)",
+            IpAllocation::Slaac => "无状态地址自动配置 (SLAAC)",
+            IpAllocation::Other => "其他来源 (Other)",
+            IpAllocation::Unknown => "未知 (Unknown)",
+            IpAllocation::Mixed => "混合来源 (Mixed)",
         },
         Language::En => match alloc {
-            crate::shared::IpAllocation::Dynamic => "Dynamic (DHCP)",
-            crate::shared::IpAllocation::Static => "Static",
-            crate::shared::IpAllocation::Unknown => "Unknown",
+            IpAllocation::Manual => "Manual",
+            IpAllocation::Dhcpv4 => "DHCPv4",
+            IpAllocation::Dhcpv6 => "DHCPv6",
+            IpAllocation::RouterAdvertisement => "Router Advertisement (RA)",
+            IpAllocation::Slaac => "SLAAC",
+            IpAllocation::Other => "Other",
+            IpAllocation::Unknown => "Unknown",
+            IpAllocation::Mixed => "Mixed",
         },
+    }
+}
+
+/// DNS 采集来源的本地化封装。
+pub fn localize_dns_source(source: DnsSource) -> &'static str {
+    match current() {
+        Language::Zh => match source {
+            DnsSource::SystemdResolved => "systemd-resolved",
+            DnsSource::NetworkManager => "NetworkManager",
+            DnsSource::ResolvConf => "resolv.conf 回退",
+            DnsSource::Scutil => "scutil",
+            DnsSource::WindowsAdapter => "Windows 适配器",
+        },
+        Language::En => match source {
+            DnsSource::SystemdResolved => "systemd-resolved",
+            DnsSource::NetworkManager => "NetworkManager",
+            DnsSource::ResolvConf => "resolv.conf fallback",
+            DnsSource::Scutil => "scutil",
+            DnsSource::WindowsAdapter => "Windows adapter",
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_unicode_width_for_combining_emoji_and_labels() {
+        assert_eq!(display_width("中文标签"), 8);
+        assert_eq!(display_width("e\u{0301}"), 1);
+        assert_eq!(display_width("👩‍🔬"), 2);
+        assert_eq!(display_width("#\u{FE0F}"), 2);
+        assert_eq!(display_width("A·B"), 3);
+    }
+
+    #[test]
+    fn pads_by_terminal_columns() {
+        assert_eq!(pad_right("中文", 6), "中文  ");
+        assert_eq!(pad_right("e\u{0301}", 3), "e\u{0301}  ");
+        assert_eq!(pad_right("English", 4), "English");
     }
 }

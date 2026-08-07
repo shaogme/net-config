@@ -1,18 +1,106 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::ptr;
-use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
-use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, GetBestInterface, IP_ADAPTER_ADDRESSES_LH,
-};
-use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
-};
+mod ffi;
+
+use std::net::{IpAddr, Ipv4Addr};
 
 use crate::shared::{
-    InterfaceStats, InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info, Ipv6Info,
-    NetworkInterface, NetworkInterfaces,
+    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceBuilder, InterfaceStatus,
+    InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterfaces, Route,
+    normalize_interfaces,
 };
-use std::net::IpAddr;
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    IF_TYPE_ETHERNET_CSMACD, IF_TYPE_FAST, IF_TYPE_FASTETHER, IF_TYPE_FASTETHER_FX,
+    IF_TYPE_GIGABITETHERNET, IF_TYPE_IEEE8023AD_LAG, IF_TYPE_IEEE80211, IF_TYPE_L2_VLAN,
+    IF_TYPE_L3_IPVLAN, IF_TYPE_L3_IPXVLAN, IF_TYPE_OTHER, IF_TYPE_PPP, IF_TYPE_PROP_VIRTUAL,
+    IF_TYPE_SLIP, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, IF_TYPE_VIRTUALIPADDRESS,
+};
+use windows_sys::Win32::NetworkManagement::Ndis::{
+    NdisMedium802_3, NdisMediumLoopback, NdisMediumNative802_11, NdisMediumTunnel,
+    NdisMediumWirelessWan, NdisPhysicalMedium802_3, NdisPhysicalMediumNative802_11,
+    NdisPhysicalMediumWirelessLan, NdisPhysicalMediumWirelessWan, TUNNEL_TYPE_NONE,
+};
+
+struct WindowsRoute {
+    interface_index: u32,
+    family: AddressFamily,
+    destination: IpAddr,
+    prefix_len: u8,
+    gateway: Option<IpAddr>,
+    gateway_scope: Option<String>,
+    metric: u32,
+    is_default: bool,
+}
+
+impl WindowsRoute {
+    fn clone_for_interface(&self, interface: &str) -> Route {
+        let gateway_scope = self.gateway_scope.clone().or_else(|| match self.gateway {
+            Some(IpAddr::V6(address)) if address.is_unicast_link_local() => {
+                Some(self.interface_index.to_string())
+            }
+            _ => None,
+        });
+
+        Route {
+            family: self.family,
+            destination: self.destination,
+            prefix_len: self.prefix_len,
+            gateway: self.gateway,
+            gateway_scope,
+            interface: interface.to_string(),
+            metric: Some(self.metric),
+            is_default: self.is_default,
+        }
+    }
+}
+
+fn normalize_gateway(address: IpAddr) -> Option<IpAddr> {
+    (!address.is_unspecified()).then_some(address)
+}
+
+fn get_windows_routes() -> Result<Vec<WindowsRoute>, NetworkError> {
+    let rows = ffi::get_forward_rows()?;
+    let mut routes = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        if let Some((family, destination, _)) =
+            ffi::sockaddr_inet_to_ip(&row.DestinationPrefix.Prefix)
+        {
+            let prefix_len = row.DestinationPrefix.PrefixLength;
+            let max_prefix_len = match family {
+                AddressFamily::Ipv4 => 32,
+                AddressFamily::Ipv6 => 128,
+            };
+            if prefix_len > max_prefix_len {
+                return Err(NetworkError::invariant(format!(
+                    "GetIpForwardTable2 returned an invalid prefix length {}",
+                    prefix_len
+                )));
+            }
+            let next_hop = ffi::sockaddr_inet_to_ip(&row.NextHop);
+            let gateway = next_hop
+                .filter(|(next_family, _, _)| *next_family == family)
+                .map(|(_, address, _)| address)
+                .and_then(normalize_gateway);
+            let gateway_scope = next_hop
+                .filter(|(next_family, _, _)| *next_family == family)
+                .and_then(|(_, address, scope_id)| {
+                    normalize_gateway(address).and(scope_id.map(|scope| scope.to_string()))
+                });
+
+            routes.push(WindowsRoute {
+                interface_index: row.InterfaceIndex,
+                family,
+                destination,
+                prefix_len,
+                gateway,
+                gateway_scope,
+                metric: row.Metric,
+                is_default: destination.is_unspecified() && prefix_len == 0,
+            });
+        }
+    }
+
+    Ok(routes)
+}
 
 /// 计算 IPv4 前缀对应的子网掩码
 fn prefix_to_ipv4_mask(prefix: u8) -> Ipv4Addr {
@@ -26,81 +114,100 @@ fn prefix_to_ipv4_mask(prefix: u8) -> Ipv4Addr {
     }
 }
 
-pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
-    // 1. 获取主网卡接口索引 (GetBestInterface)
-    let mut best_index = 0u32;
-    // 传入 8.8.8.8 的大端表示 (0x08080808) 探测最优网络接口
-    let has_best_interface =
-        unsafe { GetBestInterface(0x08080808, &mut best_index) } == ERROR_SUCCESS;
+fn windows_ip_allocation(
+    family: AddressFamily,
+    prefix_origin: i32,
+    suffix_origin: i32,
+) -> IpAllocation {
+    match prefix_origin {
+        0 | 2 => IpAllocation::Other,
+        1 => IpAllocation::Manual,
+        3 => match family {
+            AddressFamily::Ipv4 => IpAllocation::Dhcpv4,
+            AddressFamily::Ipv6 => IpAllocation::Dhcpv6,
+        },
+        4 if family == AddressFamily::Ipv6 && matches!(suffix_origin, 4 | 5) => IpAllocation::Slaac,
+        4 => IpAllocation::RouterAdvertisement,
+        _ => IpAllocation::Unknown,
+    }
+}
 
-    // 2. 准备缓冲区以调用 GetAdaptersAddresses
-    let mut buf_len = 15000;
-    let mut buf = vec![0u8; buf_len as usize];
-    let family = AF_UNSPEC as u32;
-
-    let mut res = unsafe {
-        GetAdaptersAddresses(
-            family,
-            GAA_FLAG_INCLUDE_GATEWAYS,
-            ptr::null_mut(),
-            buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
-            &mut buf_len,
-        )
-    };
-
-    if res == ERROR_BUFFER_OVERFLOW {
-        buf.resize(buf_len as usize, 0);
-        res = unsafe {
-            GetAdaptersAddresses(
-                family,
-                GAA_FLAG_INCLUDE_GATEWAYS,
-                ptr::null_mut(),
-                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
-                &mut buf_len,
-            )
-        };
+fn windows_interface_type(
+    if_type: u32,
+    tunnel_type: i32,
+    media_type: Option<i32>,
+    physical_medium_type: Option<i32>,
+) -> InterfaceType {
+    if if_type == IF_TYPE_SOFTWARE_LOOPBACK || media_type == Some(NdisMediumLoopback) {
+        return InterfaceType::Loopback;
+    }
+    if if_type == IF_TYPE_TUNNEL
+        || if_type == IF_TYPE_PPP
+        || if_type == IF_TYPE_SLIP
+        || tunnel_type != TUNNEL_TYPE_NONE
+        || media_type == Some(NdisMediumTunnel)
+    {
+        return InterfaceType::Tunnel;
+    }
+    if matches!(
+        if_type,
+        IF_TYPE_PROP_VIRTUAL
+            | IF_TYPE_VIRTUALIPADDRESS
+            | IF_TYPE_L2_VLAN
+            | IF_TYPE_L3_IPVLAN
+            | IF_TYPE_L3_IPXVLAN
+    ) {
+        return InterfaceType::Virtual;
+    }
+    if if_type == IF_TYPE_IEEE80211
+        || media_type == Some(NdisMediumNative802_11)
+        || physical_medium_type.is_some_and(|value| {
+            value == NdisPhysicalMediumNative802_11 || value == NdisPhysicalMediumWirelessLan
+        })
+    {
+        return InterfaceType::WiFi;
+    }
+    if media_type == Some(NdisMediumWirelessWan)
+        || physical_medium_type == Some(NdisPhysicalMediumWirelessWan)
+    {
+        return InterfaceType::Other;
+    }
+    if matches!(
+        if_type,
+        IF_TYPE_ETHERNET_CSMACD
+            | IF_TYPE_FAST
+            | IF_TYPE_FASTETHER
+            | IF_TYPE_FASTETHER_FX
+            | IF_TYPE_GIGABITETHERNET
+            | IF_TYPE_IEEE8023AD_LAG
+    ) || media_type == Some(NdisMedium802_3)
+        || physical_medium_type == Some(NdisPhysicalMedium802_3)
+    {
+        return InterfaceType::Ethernet;
+    }
+    if if_type == IF_TYPE_OTHER {
+        return InterfaceType::Other;
     }
 
-    if res != ERROR_SUCCESS {
-        return Err(format!(
-            "GetAdaptersAddresses failed with error code {}",
-            res
-        ));
-    }
+    InterfaceType::Unknown
+}
 
-    let mut primary: Option<NetworkInterface> = None;
-    let mut other: Vec<NetworkInterface> = Vec::new();
+pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
+    // 1. 获取完整路由表。适配器上的 gateway 列表不包含目的前缀和 metric，
+    // 不能用于建立可靠的地址到网关关系。
+    let routes = get_windows_routes()?;
 
-    let mut current = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    // 2. 由 FFI 适配层负责缓冲区扩容、边界和链表解析。
+    let adapters = ffi::get_adapters()?;
 
-    while !current.is_null() {
-        let adapter = unsafe { &*current };
+    let mut interfaces = Vec::new();
+    let mut dns_servers = Vec::new();
 
-        // 提取适配器的唯一名称 (GUID)
-        let name = if !adapter.AdapterName.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(adapter.AdapterName as *const i8) }
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            String::new()
-        };
+    for adapter in adapters {
+        let name = adapter.name;
+        let description = adapter.description;
 
-        // 提取适配器的友好描述名称
-        let description = if !adapter.FriendlyName.is_null() {
-            let mut len = 0;
-            while unsafe { *adapter.FriendlyName.add(len) } != 0 {
-                len += 1;
-            }
-            let slice = unsafe { std::slice::from_raw_parts(adapter.FriendlyName, len) };
-            String::from_utf16_lossy(slice)
-        } else {
-            String::new()
-        };
-
-        // 提取 MAC 地址
-        let mac_address = if adapter.PhysicalAddressLength > 0 {
-            let len = adapter.PhysicalAddressLength as usize;
-            let mac_bytes = &adapter.PhysicalAddress[..len];
+        let mac_address = if let Some(mac_bytes) = adapter.mac_address {
             let mac_str = mac_bytes
                 .iter()
                 .map(|b| format!("{:02X}", b))
@@ -111,237 +218,178 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, String> {
             None
         };
 
-        // 判定是否为主网卡
-        let is_primary = has_best_interface
-            && (unsafe { adapter.Anonymous1.Anonymous.IfIndex } == best_index
-                || adapter.Ipv6IfIndex == best_index);
+        let interface_index = adapter.interface_index;
+        let details = ffi::get_interface_details(interface_index);
+        let interface_routes = routes
+            .iter()
+            .filter(|route| {
+                (route.family == AddressFamily::Ipv4 && route.interface_index == interface_index)
+                    || (route.family == AddressFamily::Ipv6
+                        && adapter.ipv6_interface_index != 0
+                        && route.interface_index == adapter.ipv6_interface_index)
+            })
+            .map(|route| route.clone_for_interface(&name))
+            .collect::<Vec<Route>>();
+        let interface_type = windows_interface_type(
+            details.map_or(adapter.interface_type, |value| value.interface_type),
+            details.map_or(adapter.tunnel_type, |value| value.tunnel_type),
+            details.map(|value| value.media_type),
+            details.map(|value| value.physical_medium_type),
+        );
 
-        let mut ipv4_addresses = Vec::new();
-        let mut ipv6_addresses = Vec::new();
-
-        // 3. 提取单播 IP 地址列表
-        let mut unicast_ptr = adapter.FirstUnicastAddress;
-        while !unicast_ptr.is_null() {
-            let unicast = unsafe { &*unicast_ptr };
-            let lp_sockaddr = unicast.Address.lpSockaddr;
-
-            if !lp_sockaddr.is_null() {
-                let sa_family = unsafe { (*lp_sockaddr).sa_family };
-                let prefix_origin = unicast.PrefixOrigin;
-                let is_dhcp_adapter = (unsafe { adapter.Anonymous2.Flags } & 0x0004) != 0;
-
-                let alloc = match prefix_origin {
-                    1 => IpAllocation::Static,
-                    3 | 4 => IpAllocation::Dynamic,
-                    _ => {
-                        if is_dhcp_adapter {
-                            IpAllocation::Dynamic
-                        } else {
-                            IpAllocation::Static
-                        }
-                    }
-                };
-
-                if sa_family as u32 == AF_INET as u32 {
-                    let sock_in = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN) };
-                    // 提取 IPv4 地址字节
-                    let s_addr = unsafe { sock_in.sin_addr.S_un.S_addr };
-                    let ip_bytes = s_addr.to_ne_bytes();
-                    let ip = Ipv4Addr::from(ip_bytes);
-
-                    let prefix_len = unicast.OnLinkPrefixLength;
-                    let netmask = prefix_to_ipv4_mask(prefix_len);
-
-                    ipv4_addresses.push(Ipv4Info {
-                        address: ip,
-                        netmask,
-                        prefix_len,
-                        gateways: Vec::new(),
-                        allocation: alloc,
-                    });
-                } else if sa_family as u32 == AF_INET6 as u32 {
-                    let sock_in6 = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN6) };
-                    // 提取 IPv6 地址字节
-                    let ip_bytes = unsafe { sock_in6.sin6_addr.u.Byte };
-                    let ip = Ipv6Addr::from(ip_bytes);
-                    let prefix_len = unicast.OnLinkPrefixLength;
-
-                    ipv6_addresses.push(Ipv6Info {
-                        address: ip,
-                        prefix_len,
-                        gateways: Vec::new(),
-                        allocation: alloc,
-                    });
-                }
-            }
-            unicast_ptr = unicast.Next;
-        }
-
-        // 4. 提取网关地址列表
-        let mut gateways_ipv4 = Vec::new();
-        let mut gateways_ipv6 = Vec::new();
-
-        let mut gateway_ptr = adapter.FirstGatewayAddress;
-        while !gateway_ptr.is_null() {
-            let gateway = unsafe { &*gateway_ptr };
-            let lp_sockaddr = gateway.Address.lpSockaddr;
-
-            if !lp_sockaddr.is_null() {
-                let sa_family = unsafe { (*lp_sockaddr).sa_family };
-
-                if sa_family as u32 == AF_INET as u32 {
-                    let sock_in = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN) };
-                    let s_addr = unsafe { sock_in.sin_addr.S_un.S_addr };
-                    let ip_bytes = s_addr.to_ne_bytes();
-                    let ip = Ipv4Addr::from(ip_bytes);
-                    gateways_ipv4.push(ip);
-                } else if sa_family as u32 == AF_INET6 as u32 {
-                    let sock_in6 = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN6) };
-                    let ip_bytes = unsafe { sock_in6.sin6_addr.u.Byte };
-                    let ip = Ipv6Addr::from(ip_bytes);
-                    gateways_ipv6.push(ip);
-                }
-            }
-            gateway_ptr = gateway.Next;
-        }
-
-        // 5. 将获取到的网关绑定到各 IP 配置上
-        for ip_info in &mut ipv4_addresses {
-            ip_info.gateways = gateways_ipv4.clone();
-        }
-        for ip_info in &mut ipv6_addresses {
-            ip_info.gateways = gateways_ipv6.clone();
-        }
-
-        // 确定接口状态
-        let status = match adapter.OperStatus {
+        // 3. 提取已由 FFI 适配层验证过的单播 IP 地址列表。
+        let status = match adapter.oper_status {
             1 => InterfaceStatus::Up,
             2 => InterfaceStatus::Down,
             3 => InterfaceStatus::Testing,
             _ => InterfaceStatus::Unknown,
         };
+        let mut builder = InterfaceBuilder::new(name.clone(), description, status);
+        builder.set_interface_type(interface_type);
+        if let Some(mac_address) = mac_address {
+            builder.set_mac_address(mac_address);
+        }
 
-        // 确定接口类型
-        let lower_desc = description.to_lowercase();
-        let lower_name = name.to_lowercase();
-        let is_virtual = lower_desc.contains("virtual")
-            || lower_desc.contains("vpn")
-            || lower_desc.contains("wsl")
-            || lower_desc.contains("docker")
-            || lower_desc.contains("tap")
-            || lower_desc.contains("hyper-v")
-            || lower_desc.contains("loopback")
-            || lower_name.contains("loopback")
-            || lower_desc.contains("zerotier")
-            || lower_desc.contains("wireguard");
+        for unicast in adapter.unicast_addresses {
+            let Some(address) = unicast.address else {
+                continue;
+            };
+            let family = address.family;
+            let alloc = windows_ip_allocation(family, unicast.prefix_origin, unicast.suffix_origin);
 
-        let interface_type = match adapter.IfType {
-            24 => InterfaceType::Loopback,
-            71 => InterfaceType::WiFi,
-            131 => InterfaceType::Tunnel,
-            _ => {
-                if is_virtual {
-                    InterfaceType::Virtual
-                } else if adapter.IfType == 6 {
-                    InterfaceType::Ethernet
-                } else {
-                    InterfaceType::Other
-                }
+            if family == AddressFamily::Ipv4 {
+                let IpAddr::V4(ip) = address.address else {
+                    continue;
+                };
+                let prefix_len = unicast.prefix_len;
+                let netmask = prefix_to_ipv4_mask(prefix_len);
+
+                builder.add_ipv4_address(Ipv4Info {
+                    address: ip,
+                    netmask,
+                    prefix_len,
+                    allocation: alloc,
+                });
+            } else if let IpAddr::V6(ip) = address.address {
+                let prefix_len = unicast.prefix_len;
+                builder.add_ipv6_address(Ipv6Info {
+                    address: ip,
+                    prefix_len,
+                    allocation: alloc,
+                });
             }
-        };
+        }
 
-        // 确定链路速度
-        let raw_speed = adapter.TransmitLinkSpeed.max(adapter.ReceiveLinkSpeed);
+        // 4. 确定链路速度
+        let raw_speed = adapter.transmit_link_speed.max(adapter.receive_link_speed);
         let link_speed = if raw_speed > 0 && raw_speed != u64::MAX {
             Some(raw_speed)
         } else {
             None
         };
+        if let Some(link_speed) = link_speed {
+            builder.set_link_speed(link_speed);
+        }
 
-        // 提取 DNS 服务器地址
-        let mut dns_servers = Vec::new();
-        let mut dns_ptr = adapter.FirstDnsServerAddress;
-        while !dns_ptr.is_null() {
-            let dns_addr = unsafe { &*dns_ptr };
-            let lp_sockaddr = dns_addr.Address.lpSockaddr;
-            if !lp_sockaddr.is_null() {
-                let sa_family = unsafe { (*lp_sockaddr).sa_family };
-                if sa_family as u32 == AF_INET as u32 {
-                    let sock_in = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN) };
-                    let s_addr = unsafe { sock_in.sin_addr.S_un.S_addr };
-                    let ip_bytes = s_addr.to_ne_bytes();
-                    dns_servers.push(IpAddr::V4(Ipv4Addr::from(ip_bytes)));
-                } else if sa_family as u32 == AF_INET6 as u32 {
-                    let sock_in6 = unsafe { &*(lp_sockaddr as *const SOCKADDR_IN6) };
-                    let ip_bytes = unsafe { sock_in6.sin6_addr.u.Byte };
-                    dns_servers.push(IpAddr::V6(Ipv6Addr::from(ip_bytes)));
+        // 5. 提取已由 FFI 适配层验证过的 DNS 服务器地址。
+        for dns_addr in adapter.dns_servers {
+            if dns_addr.family == AddressFamily::Ipv4 {
+                if let IpAddr::V4(address) = dns_addr.address {
+                    dns_servers.push(DnsServer {
+                        address: IpAddr::V4(address),
+                        interface: Some(name.clone()),
+                        source: DnsSource::WindowsAdapter,
+                    });
                 }
+            } else if let IpAddr::V6(address) = dns_addr.address {
+                dns_servers.push(DnsServer {
+                    address: IpAddr::V6(address),
+                    interface: Some(name.clone()),
+                    source: DnsSource::WindowsAdapter,
+                });
             }
-            dns_ptr = dns_addr.Next;
         }
 
-        // 提取流量统计数据 (GetIfEntry2)
-        use windows_sys::Win32::NetworkManagement::IpHelper::{GetIfEntry2, MIB_IF_ROW2};
-        let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
-        row.InterfaceIndex = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
-        let statistics = if unsafe { GetIfEntry2(&mut row) } == 0 {
-            Some(InterfaceStats {
-                rx_bytes: row.InOctets,
-                tx_bytes: row.OutOctets,
-                rx_packets: row.InUcastPkts + row.InNUcastPkts,
-                tx_packets: row.OutUcastPkts + row.OutNUcastPkts,
-            })
-        } else {
-            None
-        };
+        // 6. 提取由 GetIfEntry2 返回的统计数据。
+        if let Some(details) = details {
+            builder.set_statistics(details.statistics);
+        }
 
-        let is_dhcp_enabled = (unsafe { adapter.Anonymous2.Flags } & 0x0004) != 0;
-        let has_dynamic_ip = ipv4_addresses
-            .iter()
-            .any(|i| i.allocation == IpAllocation::Dynamic)
-            || ipv6_addresses
-                .iter()
-                .any(|i| i.allocation == IpAllocation::Dynamic);
-        let allocation = if is_dhcp_enabled || has_dynamic_ip {
-            IpAllocation::Dynamic
-        } else if !ipv4_addresses.is_empty() || !ipv6_addresses.is_empty() {
-            IpAllocation::Static
-        } else {
+        builder.set_routes(interface_routes);
+        interfaces.push(builder.build());
+    }
+
+    let dns = DnsConfiguration::from_servers(dns_servers);
+    Ok(normalize_interfaces(interfaces, dns))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn unspecified_gateway_is_not_exposed() {
+        assert_eq!(normalize_gateway(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), None);
+        assert_eq!(normalize_gateway(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), None);
+        assert_eq!(
+            normalize_gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+        );
+    }
+
+    #[test]
+    fn maps_windows_address_origins_without_adapter_fallback() {
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv4, 3, 0),
+            IpAllocation::Dhcpv4
+        );
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv6, 3, 0),
+            IpAllocation::Dhcpv6
+        );
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv6, 4, 5),
+            IpAllocation::Slaac
+        );
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv6, 4, 1),
+            IpAllocation::RouterAdvertisement
+        );
+        assert_eq!(
+            windows_ip_allocation(AddressFamily::Ipv4, 5, 0),
             IpAllocation::Unknown
-        };
-
-        let iface = NetworkInterface {
-            name,
-            description,
-            mac_address,
-            ipv4_addresses,
-            ipv6_addresses,
-            status,
-            interface_type,
-            allocation,
-            link_speed,
-            dns_servers,
-            statistics,
-        };
-
-        if is_primary && primary.is_none() {
-            primary = Some(iface);
-        } else {
-            other.push(iface);
-        }
-
-        current = adapter.Next;
+        );
     }
 
-    // 保底：若无主网卡，选择第一个非环回有IP绑定的网卡作为 primary
-    if primary.is_none()
-        && let Some(pos) = other.iter().position(|i| {
-            !i.description.to_lowercase().contains("loopback")
-                && (!i.ipv4_addresses.is_empty() || !i.ipv6_addresses.is_empty())
-        })
-    {
-        primary = Some(other.remove(pos));
-    }
+    #[test]
+    fn classifies_windows_interfaces_from_iftype_tunnel_and_media() {
+        use windows_sys::Win32::NetworkManagement::Ndis::TUNNEL_TYPE_DIRECT;
 
-    Ok(NetworkInterfaces { primary, other })
+        assert_eq!(
+            windows_interface_type(IF_TYPE_IEEE80211, TUNNEL_TYPE_NONE, None, None),
+            InterfaceType::WiFi
+        );
+        assert_eq!(
+            windows_interface_type(IF_TYPE_OTHER, TUNNEL_TYPE_DIRECT, None, None),
+            InterfaceType::Tunnel
+        );
+        assert_eq!(
+            windows_interface_type(IF_TYPE_PROP_VIRTUAL, TUNNEL_TYPE_NONE, None, None),
+            InterfaceType::Virtual
+        );
+        assert_eq!(
+            windows_interface_type(
+                IF_TYPE_OTHER,
+                TUNNEL_TYPE_NONE,
+                None,
+                Some(NdisPhysicalMediumWirelessLan),
+            ),
+            InterfaceType::WiFi
+        );
+        assert_eq!(
+            windows_interface_type(999, TUNNEL_TYPE_NONE, None, None),
+            InterfaceType::Unknown
+        );
+    }
 }

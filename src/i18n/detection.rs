@@ -1,33 +1,14 @@
 use crate::i18n::Language;
 
+const LANGUAGE_ENV_VARS: [&str; 4] = ["NET_CONFIG_LANG", "LC_ALL", "LC_MESSAGES", "LANG"];
+
 /// 跨平台自动检测当前系统语言
 pub fn detect_system_language() -> Language {
-    // 1. 优先读取自定义环境变量，供用户手动覆盖
-    if let Ok(lang) = std::env::var("NET_CONFIG_LANG")
-        && let Some(parsed) = Language::from_str(&lang)
-    {
-        return parsed;
+    if let Some(language) = detect_language(|name| std::env::var(name).ok()) {
+        return language;
     }
 
-    // 2. 读取通用 UNIX 环境变量 LANG
-    if let Ok(lang) = std::env::var("LANG") {
-        if lang.to_lowercase().starts_with("zh") {
-            return Language::Zh;
-        } else if lang.to_lowercase().starts_with("en") {
-            return Language::En;
-        }
-    }
-
-    // 3. 读取通用 UNIX 环境变量 LC_ALL
-    if let Ok(lang) = std::env::var("LC_ALL") {
-        if lang.to_lowercase().starts_with("zh") {
-            return Language::Zh;
-        } else if lang.to_lowercase().starts_with("en") {
-            return Language::En;
-        }
-    }
-
-    // 4. Windows 平台特有的原生 API 检测
+    // 环境变量未提供受支持的语言时，再使用 Windows 原生 UI 语言。
     #[cfg(target_os = "windows")]
     {
         if let Some(lang) = detect_windows_ui_language() {
@@ -37,6 +18,20 @@ pub fn detect_system_language() -> Language {
 
     // 5. 默认回退语言：En (英文)
     Language::En
+}
+
+/// 按 POSIX 语言环境优先级检测语言。
+///
+/// `NET_CONFIG_LANG` 是应用级覆盖，随后依次使用 `LC_ALL`、`LC_MESSAGES`
+/// 和 `LANG`。查找函数由调用方注入，避免测试依赖测试机的真实环境变量。
+pub(crate) fn detect_language<F>(mut lookup: F) -> Option<Language>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    LANGUAGE_ENV_VARS
+        .into_iter()
+        .filter_map(|name| lookup(name).and_then(|value| Language::from_locale(&value)))
+        .next()
 }
 
 /// Windows 平台特有的原生语言检测
@@ -77,5 +72,57 @@ fn detect_windows_ui_language() -> Option<Language> {
         Some(Language::En)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn language_from(values: &[(&str, &str)]) -> Option<Language> {
+        let values: HashMap<_, _> = values
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        detect_language(|name| values.get(name).cloned())
+    }
+
+    #[test]
+    fn application_override_has_highest_priority() {
+        assert_eq!(
+            language_from(&[
+                ("NET_CONFIG_LANG", "en_US.UTF-8"),
+                ("LC_ALL", "zh_CN.UTF-8"),
+                ("LC_MESSAGES", "zh_TW.UTF-8"),
+                ("LANG", "zh_CN.UTF-8"),
+            ]),
+            Some(Language::En)
+        );
+    }
+
+    #[test]
+    fn posix_variables_are_checked_in_standard_order() {
+        assert_eq!(
+            language_from(&[("LC_ALL", "en_GB.UTF-8"), ("LANG", "zh_CN.UTF-8")]),
+            Some(Language::En)
+        );
+        assert_eq!(
+            language_from(&[("LC_MESSAGES", "zh_TW.UTF-8"), ("LANG", "en_US.UTF-8")]),
+            Some(Language::Zh)
+        );
+        assert_eq!(
+            language_from(&[("LANG", "zh_CN.UTF-8")]),
+            Some(Language::Zh)
+        );
+    }
+
+    #[test]
+    fn unsupported_or_empty_values_are_skipped() {
+        assert_eq!(
+            language_from(&[("LC_ALL", "fr_FR.UTF-8"), ("LANG", "en_US.UTF-8")]),
+            Some(Language::En)
+        );
+        assert_eq!(language_from(&[("LANG", "C")]), None);
     }
 }
