@@ -1,11 +1,22 @@
 use serde::{Deserialize, Serialize};
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 use std::collections::BTreeSet;
+
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::{fmt, io, path::PathBuf, process::ExitStatus};
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use std::io;
+
+#[cfg(any(target_os = "linux", test))]
+use std::path::PathBuf;
+
+#[cfg(target_os = "macos")]
+use std::process::ExitStatus;
 
 /// 物理/虚拟接口运行状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub enum InterfaceStatus {
     Up,
     Down,
@@ -15,7 +26,6 @@ pub enum InterfaceStatus {
 
 /// 网卡物理介质/接口类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub enum InterfaceType {
     Ethernet,
     WiFi,
@@ -53,6 +63,7 @@ pub enum IpAllocation {
 /// 空地址列表和只有未知来源的地址都返回 `Unknown`。只有所有地址来源完全
 /// 相同才返回该来源；任何来源差异（包括已知来源与未知来源并存）都返回
 /// `Mixed`，避免把部分证据误报成整个接口的单一配置方式。
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 pub fn aggregate_allocations<I>(allocations: I) -> IpAllocation
 where
     I: IntoIterator<Item = IpAllocation>,
@@ -99,6 +110,7 @@ pub struct Route {
 }
 
 /// 按稳定规则排序路由，避免 HashMap 或平台 API 顺序泄漏到输出。
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 pub fn sort_routes(routes: &mut [Route]) {
     routes.sort_by(|left, right| {
         left.family
@@ -112,12 +124,13 @@ pub fn sort_routes(routes: &mut [Route]) {
 }
 
 /// 按接口名称排序，避免平台 API 或 HashMap 的遍历顺序泄漏到输出。
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 pub fn sort_interfaces(interfaces: &mut [NetworkInterface]) {
     interfaces.sort_by(|left, right| left.name.cmp(&right.name));
 }
 
 /// 将连续 IPv4 子网掩码转换为前缀长度。
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub(crate) fn ipv4_prefix_len(netmask: Ipv4Addr) -> Option<u8> {
     let value = u32::from_be_bytes(netmask.octets());
     let prefix_len = value.leading_ones() as u8;
@@ -130,7 +143,7 @@ pub(crate) fn ipv4_prefix_len(netmask: Ipv4Addr) -> Option<u8> {
 }
 
 /// 将连续 IPv6 子网掩码转换为前缀长度。
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub(crate) fn ipv6_prefix_len(netmask: Ipv6Addr) -> Option<u8> {
     let value = u128::from_be_bytes(netmask.octets());
     let prefix_len = value.leading_ones() as u8;
@@ -147,6 +160,7 @@ pub(crate) fn ipv6_prefix_len(netmask: Ipv6Addr) -> Option<u8> {
 /// 有效默认路由优先于无路由接口；同类候选再依次比较默认路由 metric、
 /// 接口状态、是否为环回、接口类型和名称。没有默认路由时，只考虑非环回且
 /// 至少绑定一个 IP 地址的接口，避免无地址接口被错误地选为主接口。
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 pub fn select_primary_interface(interfaces: &[NetworkInterface]) -> Option<usize> {
     let has_default_route = interfaces.iter().any(interface_has_default_route);
     interfaces
@@ -165,6 +179,7 @@ pub fn select_primary_interface(interfaces: &[NetworkInterface]) -> Option<usize
         .map(|(index, _)| index)
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn interface_has_default_route(interface: &NetworkInterface) -> bool {
     interface.routes.iter().any(|route| {
         route.interface == interface.name
@@ -174,14 +189,17 @@ fn interface_has_default_route(interface: &NetworkInterface) -> bool {
     })
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn interface_has_addresses(interface: &NetworkInterface) -> bool {
     !interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty()
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn is_loopback_interface(interface: &NetworkInterface) -> bool {
     interface.interface_type == InterfaceType::Loopback || interface.name.starts_with("lo")
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn primary_interface_key(interface: &NetworkInterface) -> (u8, u32, u8, u8, u8, &str) {
     let default_route = interface
         .routes
@@ -206,6 +224,7 @@ fn primary_interface_key(interface: &NetworkInterface) -> (u8, u32, u8, u8, u8, 
     )
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn interface_status_rank(status: InterfaceStatus) -> u8 {
     match status {
         InterfaceStatus::Up => 0,
@@ -215,6 +234,7 @@ fn interface_status_rank(status: InterfaceStatus) -> u8 {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn interface_type_rank(interface_type: InterfaceType) -> u8 {
     match interface_type {
         InterfaceType::Ethernet => 0,
@@ -267,6 +287,7 @@ pub struct DnsConfiguration {
 }
 
 impl DnsConfiguration {
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
     pub fn from_servers(mut servers: Vec<DnsServer>) -> Self {
         sort_dns_servers(&mut servers);
         servers.dedup();
@@ -278,7 +299,7 @@ impl DnsConfiguration {
         Self { status, servers }
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn unavailable() -> Self {
         Self {
             status: DnsStatus::Unavailable,
@@ -307,7 +328,7 @@ pub enum DnsSource {
 }
 
 /// 解析 resolv.conf 风格文本中的 nameserver 行。
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub fn parse_resolv_conf(
     contents: &str,
     source: DnsSource,
@@ -330,6 +351,7 @@ pub fn parse_resolv_conf(
 }
 
 /// 按接口、来源和地址稳定排序 DNS 服务器。
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 pub fn sort_dns_servers(servers: &mut [DnsServer]) {
     servers.sort_by(|left, right| {
         left.interface
@@ -368,10 +390,12 @@ pub struct NetworkInterface {
 
 /// 用于将平台原始数据合并为统一接口模型的构造器。
 #[derive(Debug)]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 pub struct InterfaceBuilder {
     interface: NetworkInterface,
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 impl InterfaceBuilder {
     pub fn new(
         name: impl Into<String>,
@@ -395,7 +419,7 @@ impl InterfaceBuilder {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(target_os = "macos")]
     pub fn interface_type(&self) -> InterfaceType {
         self.interface.interface_type
     }
@@ -404,7 +428,7 @@ impl InterfaceBuilder {
         self.interface.interface_type = interface_type;
     }
 
-    #[allow(dead_code)]
+    #[cfg(target_os = "linux")]
     pub fn set_status(&mut self, status: InterfaceStatus) {
         self.interface.status = status;
     }
@@ -417,39 +441,42 @@ impl InterfaceBuilder {
         self.interface.ipv6_addresses.push(address);
     }
 
-    #[allow(dead_code)]
+    #[cfg(target_os = "macos")]
     pub fn ipv4_addresses(&self) -> &[Ipv4Info] {
         &self.interface.ipv4_addresses
     }
 
-    #[allow(dead_code)]
+    #[cfg(target_os = "macos")]
     pub fn ipv4_addresses_mut(&mut self) -> &mut [Ipv4Info] {
         &mut self.interface.ipv4_addresses
     }
 
-    #[allow(dead_code)]
+    #[cfg(target_os = "macos")]
     pub fn ipv6_addresses(&self) -> &[Ipv6Info] {
         &self.interface.ipv6_addresses
     }
 
-    #[allow(dead_code)]
+    #[cfg(target_os = "macos")]
     pub fn ipv6_addresses_mut(&mut self) -> &mut [Ipv6Info] {
         &mut self.interface.ipv6_addresses
     }
 
-    #[allow(dead_code)]
+    #[cfg(target_os = "macos")]
     pub fn has_addresses(&self) -> bool {
-        !self.interface.ipv4_addresses.is_empty() || !self.interface.ipv6_addresses.is_empty()
+        !self.ipv4_addresses().is_empty() || !self.ipv6_addresses().is_empty()
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     pub fn set_mac_address(&mut self, mac_address: String) {
         self.interface.mac_address = Some(mac_address);
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     pub fn set_link_speed(&mut self, link_speed: u64) {
         self.interface.link_speed = Some(link_speed);
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     pub fn set_statistics(&mut self, statistics: InterfaceStats) {
         self.interface.statistics = Some(statistics);
     }
@@ -464,6 +491,7 @@ impl InterfaceBuilder {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn normalize_interface(interface: &mut NetworkInterface) {
     sort_routes(&mut interface.routes);
     interface.allocation = aggregate_allocations(
@@ -481,6 +509,7 @@ fn normalize_interface(interface: &mut NetworkInterface) {
 }
 
 /// 将平台构造的接口统一排序，并按共享规则选择主接口。
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 pub fn normalize_interfaces(
     mut interfaces: Vec<NetworkInterface>,
     dns: DnsConfiguration,
@@ -525,18 +554,20 @@ pub struct Ipv6Info {
 /// 网络采集过程中的结构化错误。
 ///
 /// 采集器保留故障阶段和平台上下文，CLI 只在最外层将其转换为用户可读文本。
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum NetworkError {
     /// 原生系统 API 返回了失败码。
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     Api { operation: String, code: u32 },
     /// 读取系统文件或其他 IO 资源失败。
+    #[cfg(any(target_os = "linux", test))]
     Io {
         operation: String,
         path: PathBuf,
         source: io::Error,
     },
     /// 外部命令无法启动或以失败状态退出。
+    #[cfg(target_os = "macos")]
     Command {
         command: String,
         args: Vec<String>,
@@ -545,15 +576,22 @@ pub enum NetworkError {
         source: Option<io::Error>,
     },
     /// 系统 API 或系统文件的内容不符合预期格式。
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     Parse { context: String, value: String },
     /// 当前平台或运行环境不提供所需能力。
+    #[cfg(any(
+        target_os = "macos",
+        test,
+        not(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+    ))]
     Unsupported { platform: String, feature: String },
     /// 违反了采集器对系统 API 数据的内部假设。
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     Invariant { context: String },
 }
 
-#[allow(dead_code)]
 impl NetworkError {
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     pub fn api(operation: impl Into<String>, code: u32) -> Self {
         Self::Api {
             operation: operation.into(),
@@ -561,6 +599,7 @@ impl NetworkError {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub fn io(operation: impl Into<String>, path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {
             operation: operation.into(),
@@ -569,6 +608,7 @@ impl NetworkError {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub fn command_spawn(command: &str, args: &[&str], source: io::Error) -> Self {
         Self::Command {
             command: command.to_string(),
@@ -579,6 +619,7 @@ impl NetworkError {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub fn command_failed(command: &str, args: &[&str], status: ExitStatus, stderr: &[u8]) -> Self {
         Self::Command {
             command: command.to_string(),
@@ -589,6 +630,7 @@ impl NetworkError {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub fn parse(context: impl Into<String>, value: impl Into<String>) -> Self {
         Self::Parse {
             context: context.into(),
@@ -596,6 +638,11 @@ impl NetworkError {
         }
     }
 
+    #[cfg(any(
+        target_os = "macos",
+        test,
+        not(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+    ))]
     pub fn unsupported(platform: impl Into<String>, feature: impl Into<String>) -> Self {
         Self::Unsupported {
             platform: platform.into(),
@@ -603,6 +650,7 @@ impl NetworkError {
         }
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub fn invariant(context: impl Into<String>) -> Self {
         Self::Invariant {
             context: context.into(),
@@ -612,11 +660,21 @@ impl NetworkError {
     /// 稳定的机器可识别错误类别。
     pub fn code(&self) -> &'static str {
         match self {
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             Self::Api { .. } => "api",
+            #[cfg(any(target_os = "linux", test))]
             Self::Io { .. } => "io",
+            #[cfg(target_os = "macos")]
             Self::Command { .. } => "command",
+            #[cfg(any(target_os = "linux", target_os = "macos", test))]
             Self::Parse { .. } => "parse",
+            #[cfg(any(
+                target_os = "macos",
+                test,
+                not(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+            ))]
             Self::Unsupported { .. } => "unsupported",
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             Self::Invariant { .. } => "invariant",
         }
     }
@@ -625,9 +683,11 @@ impl NetworkError {
 impl fmt::Display for NetworkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             Self::Api { operation, code } => {
                 write!(formatter, "{} failed with error code {}", operation, code)
             }
+            #[cfg(any(target_os = "linux", test))]
             Self::Io {
                 operation,
                 path,
@@ -639,6 +699,7 @@ impl fmt::Display for NetworkError {
                 path.display(),
                 source
             ),
+            #[cfg(target_os = "macos")]
             Self::Command {
                 command,
                 args,
@@ -671,12 +732,19 @@ impl fmt::Display for NetworkError {
                     write!(formatter, "command {} failed", command_line)
                 }
             }
+            #[cfg(any(target_os = "linux", target_os = "macos", test))]
             Self::Parse { context, value } => {
                 write!(formatter, "failed to parse {}: {:?}", context, value)
             }
+            #[cfg(any(
+                target_os = "macos",
+                test,
+                not(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+            ))]
             Self::Unsupported { platform, feature } => {
                 write!(formatter, "{} is unsupported on {}", feature, platform)
             }
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             Self::Invariant { context } => {
                 write!(formatter, "internal invariant failed: {}", context)
             }
@@ -687,7 +755,9 @@ impl fmt::Display for NetworkError {
 impl std::error::Error for NetworkError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(any(target_os = "linux", test))]
             Self::Io { source, .. } => Some(source),
+            #[cfg(target_os = "macos")]
             Self::Command {
                 source: Some(source),
                 ..
