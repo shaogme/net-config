@@ -20,7 +20,7 @@ NetConfig 是一个用 Rust 编写的轻量级、高性能、跨平台网络接�
 - 灵活的输出格式：
   - 精美格式化的终端树状文本对齐排版。
   - 结构化的 JSON 序列化输出，便于 Shell 管道脚本调用及自动化运维。
-- 内置多语言支持：支持英文和中文。可自动检测系统环境语言，也支持通过命令行参数手动切换。使用 Unicode Standard Annex #11 宽度规则处理组合字符和 emoji 序列，确保终端标签按显示列对齐。
+- 内置多语言支持：支持英文和中文。可自动检测系统环境语言，也支持通过命令行参数手动切换。按当前语言分别计算终端标签列宽，并使用 Unicode Standard Annex #11 宽度规则处理组合字符和 emoji 序列，确保标签按显示列对齐。
 - 轻量级与安全：使用经过验证的轻量 Unicode 宽度依赖，结合 Rust 内存安全特性与原生系统调用。
 
 ## 平台实现原理
@@ -109,33 +109,50 @@ cargo build --release
  Link Speed    : 1.20 Gbps
  MAC Address   : 00:00:5E:00:53:01
  IPv4 Config   :
-   [1] Address    : 192.168.1.100
+   [01] Address    : 192.168.1.100
        Subnet Mask: 255.255.255.0 (Prefix /24)
        Allocation : DHCPv4
  IPv6 Config   :
-   [1] Address    : fe80::1000:2000:3000:4000
+   [01] Address    : fe80::1000:2000:3000:4000
        Prefix Len : /64
        Allocation : Other
  Routes        :
-   [1] Destination: Default
+   [01] Destination: Default
        Gateway    : 192.168.1.1
        Interface  : en0
        Metric     : 100
-   [2] Destination: fe80::/64
+   [02] Destination: fe80::/64
        Gateway    : On-link / None
        Interface  : en0
        Metric     : 256
  Statistics    :
-    ├── Received (Rx)   : 1.20 GiB (900000 packets)
-    └── Transmitted (Tx): 320.50 MiB (250000 packets)
+   ├── Received (Rx)   : 1.20 GiB (900000 packets)
+   └── Transmitted (Tx): 320.50 MiB (250000 packets)
 
 [System DNS]
  DNS Servers   :
-   [1] Address    : 1.1.1.1
+   [01] Address    : 1.1.1.1
        Interface  : en0
        Source     : scutil
 
 ==================================================================
+```
+
+每个列表会根据本节最大编号预留编号宽度；列表达到两位或三位编号时，标签和明细字段仍保持对齐：
+
+```text
+   [09] 目的网络: ...
+        下一跳  : ...
+   [10] 目的网络: ...
+        下一跳  : ...
+```
+
+中文本地化时，标签列宽以中文文本为基准，不复用英文列宽：
+
+```text
+ 吞吐流量统计:
+   ├── 接收 (Rx): 23.15 GiB (26118118 数据包)
+   └── 发送 (Tx): 23.85 GiB (29788944 数据包)
 ```
 
 ### JSON 输出示例
