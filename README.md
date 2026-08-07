@@ -20,7 +20,7 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
 - Flexible Outputs:
   - Polished terminal layout with clean tree-like text alignments.
   - Structured, pretty-printed JSON output for easy shell piping and automation.
-- Built-in Internationalization: Supports English and Chinese. Automatically detects the system language or allows manual overrides. Uses Unicode Standard Annex #11 width rules for terminal alignment, including combining marks and emoji sequences.
+- Built-in Internationalization: Supports English and Chinese. Automatically detects the system language or allows manual overrides. Calculates each terminal label column from the active language using Unicode Standard Annex #11 width rules, including combining marks and emoji sequences.
 - Lightweight & Safe: Uses a small, verified Unicode width dependency together with memory-safe Rust and native OS system calls.
 
 ## Platform Implementations
@@ -109,33 +109,43 @@ Below is an example of the text representation in English:
  Link Speed    : 1.20 Gbps
  MAC Address   : 00:00:5E:00:53:01
  IPv4 Config   :
-   [1] Address    : 192.168.1.100
+   [01] Address    : 192.168.1.100
        Subnet Mask: 255.255.255.0 (Prefix /24)
        Allocation : DHCPv4
  IPv6 Config   :
-   [1] Address    : fe80::1000:2000:3000:4000
+   [01] Address    : fe80::1000:2000:3000:4000
        Prefix Len : /64
        Allocation : Other
  Routes        :
-   [1] Destination: Default
+   [01] Destination: Default
        Gateway    : 192.168.1.1
        Interface  : en0
        Metric     : 100
-   [2] Destination: fe80::/64
+   [02] Destination: fe80::/64
        Gateway    : On-link / None
        Interface  : en0
        Metric     : 256
  Statistics    :
-    ├── Received (Rx)   : 1.20 GiB (900000 packets)
-    └── Transmitted (Tx): 320.50 MiB (250000 packets)
+   ├── Received (Rx)   : 1.20 GiB (900000 packets)
+   └── Transmitted (Tx): 320.50 MiB (250000 packets)
 
 [System DNS]
  DNS Servers   :
-   [1] Address    : 1.1.1.1
+   [01] Address    : 1.1.1.1
        Interface  : en0
        Source     : scutil
 
 ==================================================================
+```
+
+Indexed entries reserve the width of the largest index in their section, so labels
+and detail fields remain aligned when a list reaches two or three digits:
+
+```text
+   [09] Destination: ...
+        Gateway    : ...
+   [10] Destination: ...
+        Gateway    : ...
 ```
 
 ### JSON Output Example

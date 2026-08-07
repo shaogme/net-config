@@ -1,4 +1,4 @@
-use crate::shared::{DnsSource, IpAllocation};
+use crate::shared::{DnsSource, InterfaceStatus, InterfaceType, IpAllocation};
 use std::sync::OnceLock;
 use unicode_width::UnicodeWidthStr;
 
@@ -118,7 +118,12 @@ pub enum Text {
 impl Text {
     /// 获取翻译文本
     pub fn get(self) -> &'static str {
-        match current() {
+        self.get_for(current())
+    }
+
+    /// 按指定语言获取翻译文本，供需要稳定语言快照的渲染逻辑使用。
+    pub fn get_for(self, language: Language) -> &'static str {
+        match language {
             Language::Zh => match self {
                 Text::ProgramTitle => "NetConfig - 跨平台网络接口拓扑分析工具",
                 Text::UnknownArg => "错误: 未知的命令行参数",
@@ -127,9 +132,9 @@ impl Text {
                 Text::FetchInterfaceError => "错误：获取网卡信息失败",
                 Text::OutputError => "错误：输出失败",
                 Text::PrimaryInterfaceHeader => "主网卡 (Primary Interface)",
-                Text::NoPrimaryInterface => "  (未检测到主网卡，可能无互联网连接)",
+                Text::NoPrimaryInterface => "(未检测到主网卡，可能无互联网连接)",
                 Text::OtherInterfaceHeader => "其他网卡 (Other Interfaces)",
-                Text::NoOtherInterface => "  (无其他网卡)",
+                Text::NoOtherInterface => "(无其他网卡)",
                 Text::Usage => "用法:",
                 Text::UsageTitle => "NetConfig - 跨平台网络接口拓扑分析工具\n",
                 Text::OptionsHeader => "选项:",
@@ -148,8 +153,8 @@ impl Text {
                 Text::Ipv6Config => "IPv6 配置",
                 Text::DnsServers => "DNS 服务器",
                 Text::SystemDns => "系统 DNS",
-                Text::DnsNoServers => "  (没有配置 DNS 服务器)",
-                Text::DnsUnavailable => "  (DNS 配置不可用或未采集)",
+                Text::DnsNoServers => "(没有配置 DNS 服务器)",
+                Text::DnsUnavailable => "(DNS 配置不可用或未采集)",
                 Text::DnsInterface => "接口",
                 Text::DnsInterfaceUnknown => "系统级/未知接口",
                 Text::DnsSource => "来源",
@@ -186,10 +191,10 @@ impl Text {
                 Text::OutputError => "Error: Failed to write output",
                 Text::PrimaryInterfaceHeader => "Primary Interface",
                 Text::NoPrimaryInterface => {
-                    "  (No primary interface detected, possibly no internet connection)"
+                    "(No primary interface detected, possibly no internet connection)"
                 }
                 Text::OtherInterfaceHeader => "Other Interfaces",
-                Text::NoOtherInterface => "  (No other interfaces)",
+                Text::NoOtherInterface => "(No other interfaces)",
                 Text::Usage => "Usage:",
                 Text::UsageTitle => {
                     "NetConfig - A cross-platform network interface topology analysis tool\n"
@@ -214,8 +219,8 @@ impl Text {
                 Text::Ipv6Config => "IPv6 Config",
                 Text::DnsServers => "DNS Servers",
                 Text::SystemDns => "System DNS",
-                Text::DnsNoServers => "  (No DNS servers configured)",
-                Text::DnsUnavailable => "  (DNS configuration unavailable or not collected)",
+                Text::DnsNoServers => "(No DNS servers configured)",
+                Text::DnsUnavailable => "(DNS configuration unavailable or not collected)",
                 Text::DnsInterface => "Interface",
                 Text::DnsInterfaceUnknown => "System-wide / Unknown interface",
                 Text::DnsSource => "Source",
@@ -275,51 +280,51 @@ macro_rules! t {
     };
 }
 
-/// 接口状态的本地化封装
-pub fn localize_status(status: crate::shared::InterfaceStatus) -> &'static str {
-    match current() {
+/// 按指定语言本地化接口状态。
+pub fn localize_status_for(status: InterfaceStatus, language: Language) -> &'static str {
+    match language {
         Language::Zh => match status {
-            crate::shared::InterfaceStatus::Up => "已启用 (Up)",
-            crate::shared::InterfaceStatus::Down => "未启用 (Down)",
-            crate::shared::InterfaceStatus::Testing => "测试中 (Testing)",
-            crate::shared::InterfaceStatus::Unknown => "未知 (Unknown)",
+            InterfaceStatus::Up => "已启用 (Up)",
+            InterfaceStatus::Down => "未启用 (Down)",
+            InterfaceStatus::Testing => "测试中 (Testing)",
+            InterfaceStatus::Unknown => "未知 (Unknown)",
         },
         Language::En => match status {
-            crate::shared::InterfaceStatus::Up => "Up",
-            crate::shared::InterfaceStatus::Down => "Down",
-            crate::shared::InterfaceStatus::Testing => "Testing",
-            crate::shared::InterfaceStatus::Unknown => "Unknown",
+            InterfaceStatus::Up => "Up",
+            InterfaceStatus::Down => "Down",
+            InterfaceStatus::Testing => "Testing",
+            InterfaceStatus::Unknown => "Unknown",
         },
     }
 }
 
-/// 接口类型的本地化封装
-pub fn localize_type(itype: crate::shared::InterfaceType) -> &'static str {
-    match current() {
+/// 按指定语言本地化接口类型。
+pub fn localize_type_for(itype: InterfaceType, language: Language) -> &'static str {
+    match language {
         Language::Zh => match itype {
-            crate::shared::InterfaceType::Ethernet => "以太网 (Ethernet)",
-            crate::shared::InterfaceType::WiFi => "无线局域网 (Wi-Fi)",
-            crate::shared::InterfaceType::Loopback => "本地环回 (Loopback)",
-            crate::shared::InterfaceType::Virtual => "虚拟网卡 (Virtual / Bridge)",
-            crate::shared::InterfaceType::Tunnel => "隧道接口 (Tunnel / VPN)",
-            crate::shared::InterfaceType::Other => "其他接口 (Other)",
-            crate::shared::InterfaceType::Unknown => "未知类型 (Unknown)",
+            InterfaceType::Ethernet => "以太网 (Ethernet)",
+            InterfaceType::WiFi => "无线局域网 (Wi-Fi)",
+            InterfaceType::Loopback => "本地环回 (Loopback)",
+            InterfaceType::Virtual => "虚拟网卡 (Virtual / Bridge)",
+            InterfaceType::Tunnel => "隧道接口 (Tunnel / VPN)",
+            InterfaceType::Other => "其他接口 (Other)",
+            InterfaceType::Unknown => "未知类型 (Unknown)",
         },
         Language::En => match itype {
-            crate::shared::InterfaceType::Ethernet => "Ethernet",
-            crate::shared::InterfaceType::WiFi => "Wi-Fi",
-            crate::shared::InterfaceType::Loopback => "Loopback",
-            crate::shared::InterfaceType::Virtual => "Virtual / Bridge",
-            crate::shared::InterfaceType::Tunnel => "Tunnel / VPN",
-            crate::shared::InterfaceType::Other => "Other",
-            crate::shared::InterfaceType::Unknown => "Unknown",
+            InterfaceType::Ethernet => "Ethernet",
+            InterfaceType::WiFi => "Wi-Fi",
+            InterfaceType::Loopback => "Loopback",
+            InterfaceType::Virtual => "Virtual / Bridge",
+            InterfaceType::Tunnel => "Tunnel / VPN",
+            InterfaceType::Other => "Other",
+            InterfaceType::Unknown => "Unknown",
         },
     }
 }
 
-/// IP 分配方式的本地化封装
-pub fn localize_allocation(alloc: IpAllocation) -> &'static str {
-    match current() {
+/// 按指定语言本地化 IP 分配方式。
+pub fn localize_allocation_for(alloc: IpAllocation, language: Language) -> &'static str {
+    match language {
         Language::Zh => match alloc {
             IpAllocation::Manual => "手动配置 (Manual)",
             IpAllocation::Dhcpv4 => "DHCPv4",
@@ -343,9 +348,9 @@ pub fn localize_allocation(alloc: IpAllocation) -> &'static str {
     }
 }
 
-/// DNS 采集来源的本地化封装。
-pub fn localize_dns_source(source: DnsSource) -> &'static str {
-    match current() {
+/// 按指定语言本地化 DNS 采集来源。
+pub fn localize_dns_source_for(source: DnsSource, language: Language) -> &'static str {
+    match language {
         Language::Zh => match source {
             DnsSource::SystemdResolved => "systemd-resolved",
             DnsSource::NetworkManager => "NetworkManager",
