@@ -1,8 +1,7 @@
 use crate::shared::{
-    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceStats, InterfaceStatus,
-    InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface,
-    NetworkInterfaces, Route, aggregate_allocations, parse_resolv_conf, select_primary_interface,
-    sort_interfaces, sort_routes,
+    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceBuilder, InterfaceStats,
+    InterfaceStatus, InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError,
+    NetworkInterface, NetworkInterfaces, Route, normalize_interfaces, parse_resolv_conf,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -518,24 +517,107 @@ fn collect_linux_dns() -> DnsConfiguration {
     }
 }
 
-fn empty_linux_interface(name: &str, is_up: bool) -> NetworkInterface {
-    NetworkInterface {
-        name: name.to_string(),
-        description: name.to_string(),
-        mac_address: None,
-        ipv4_addresses: Vec::new(),
-        ipv6_addresses: Vec::new(),
-        routes: Vec::new(),
-        status: if is_up {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LinuxInterfaceFacts {
+    arp_type: Option<u32>,
+    wireless: bool,
+    has_device: bool,
+    has_driver: bool,
+    driver_name: Option<String>,
+    tunnel_marker: bool,
+    bridge_marker: bool,
+    vlan_marker: bool,
+}
+
+fn read_linux_interface_facts(name: &str) -> LinuxInterfaceFacts {
+    let base = Path::new("/sys/class/net").join(name);
+    let arp_type = std::fs::read_to_string(base.join("type"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    let driver_path = base.join("device/driver");
+    let driver_name = std::fs::read_link(driver_path).ok().and_then(|path| {
+        path.file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+    });
+
+    LinuxInterfaceFacts {
+        arp_type,
+        wireless: base.join("wireless").exists(),
+        has_device: base.join("device").exists(),
+        has_driver: driver_name.is_some(),
+        driver_name,
+        tunnel_marker: base.join("tun_flags").exists(),
+        bridge_marker: base.join("bridge").exists(),
+        vlan_marker: base.join("vlan").exists(),
+    }
+}
+
+fn linux_interface_type(name: &str, facts: &LinuxInterfaceFacts) -> InterfaceType {
+    const ARPHRD_ETHER: u32 = 1;
+    const ARPHRD_PPP: u32 = 512;
+    const ARPHRD_LOOPBACK: u32 = 772;
+    const ARPHRD_IEEE80211: u32 = 801;
+    const ARPHRD_IEEE80211_PRISM: u32 = 802;
+    const ARPHRD_TUNNEL: u32 = 768;
+    const ARPHRD_TUNNEL6: u32 = 769;
+    const ARPHRD_SIT: u32 = 776;
+    const ARPHRD_IPGRE: u32 = 778;
+    const ARPHRD_IP6GRE: u32 = 823;
+    const ARPHRD_6LOWPAN: u32 = 825;
+
+    // Linux keeps the wireless marker independently from ARPHRD_ETHER.
+    if facts.wireless
+        || matches!(
+            facts.arp_type,
+            Some(ARPHRD_IEEE80211 | ARPHRD_IEEE80211_PRISM)
+        )
+    {
+        return InterfaceType::WiFi;
+    }
+    if facts.tunnel_marker
+        || matches!(
+            facts.arp_type,
+            Some(
+                ARPHRD_PPP
+                    | ARPHRD_TUNNEL
+                    | ARPHRD_TUNNEL6
+                    | ARPHRD_SIT
+                    | ARPHRD_IPGRE
+                    | ARPHRD_IP6GRE
+            )
+        )
+    {
+        return InterfaceType::Tunnel;
+    }
+    if facts.arp_type == Some(ARPHRD_LOOPBACK) || name == "lo" {
+        return InterfaceType::Loopback;
+    }
+    if facts.bridge_marker
+        || facts.vlan_marker
+        || matches!(facts.driver_name.as_deref(), Some("wireguard" | "dummy"))
+    {
+        return InterfaceType::Virtual;
+    }
+    if facts.arp_type == Some(ARPHRD_ETHER) && facts.has_device && facts.has_driver {
+        return InterfaceType::Ethernet;
+    }
+    if facts.arp_type == Some(ARPHRD_6LOWPAN) {
+        return InterfaceType::Other;
+    }
+
+    InterfaceType::Unknown
+}
+
+fn empty_linux_interface(name: &str, is_up: bool) -> InterfaceBuilder {
+    InterfaceBuilder::new(
+        name,
+        name,
+        if is_up {
             InterfaceStatus::Up
         } else {
             InterfaceStatus::Down
         },
-        interface_type: InterfaceType::Unknown,
-        allocation: IpAllocation::Unknown,
-        link_speed: None,
-        statistics: None,
-    }
+    )
 }
 
 pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
@@ -554,7 +636,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             .map_or(0, |value| value as u32);
         return Err(NetworkError::api("getifaddrs", code));
     }
-    let mut interface_map: HashMap<String, NetworkInterface> = HashMap::new();
+    let mut interface_map: HashMap<String, InterfaceBuilder> = HashMap::new();
 
     let mut current = ifap;
     while !current.is_null() {
@@ -617,7 +699,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                 let entry = interface_map
                     .entry(ifa_name.clone())
                     .or_insert_with(|| empty_linux_interface(&ifa_name, is_up));
-                entry.ipv4_addresses.push(ipv4_info);
+                entry.add_ipv4_address(ipv4_info);
             } else if sa_family == libc::AF_INET6 {
                 let sock_in6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
                 let ip_bytes = sock_in6.sin6_addr.s6_addr;
@@ -646,7 +728,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                 let entry = interface_map
                     .entry(ifa_name.clone())
                     .or_insert_with(|| empty_linux_interface(&ifa_name, is_up));
-                entry.ipv6_addresses.push(ipv6_info);
+                entry.add_ipv6_address(ipv6_info);
             }
         }
         current = ifa.ifa_next;
@@ -677,7 +759,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             if std::io::Read::read_to_string(&mut file, &mut mac_str).is_ok() {
                 let formatted = mac_str.trim().to_uppercase();
                 if !formatted.is_empty() && formatted != "00:00:00:00:00:00" {
-                    interface.mac_address = Some(formatted);
+                    interface.set_mac_address(formatted);
                 }
             }
         }
@@ -688,74 +770,17 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             let mut state_str = String::new();
             if std::io::Read::read_to_string(&mut file, &mut state_str).is_ok() {
                 match state_str.trim() {
-                    "up" => interface.status = InterfaceStatus::Up,
-                    "down" => interface.status = InterfaceStatus::Down,
-                    "testing" => interface.status = InterfaceStatus::Testing,
+                    "up" => interface.set_status(InterfaceStatus::Up),
+                    "down" => interface.set_status(InterfaceStatus::Down),
+                    "testing" => interface.set_status(InterfaceStatus::Testing),
                     _ => {}
                 }
             }
         }
 
-        // 3. 确定网卡类型
-        let itype;
-        if name == "lo" {
-            itype = InterfaceType::Loopback;
-        } else {
-            let type_path = format!("/sys/class/net/{}/type", name);
-            let mut arp_type = 0u32;
-            if let Ok(mut file) = File::open(&type_path) {
-                let mut type_str = String::new();
-                if std::io::Read::read_to_string(&mut file, &mut type_str).is_ok()
-                    && let Ok(val) = type_str.trim().parse::<u32>()
-                {
-                    arp_type = val;
-                }
-            }
-
-            match arp_type {
-                772 => itype = InterfaceType::Loopback,
-                801 | 802 => itype = InterfaceType::WiFi,
-                1 => {
-                    let device_path = format!("/sys/class/net/{}/device", name);
-                    let is_virtual = !std::path::Path::new(&device_path).exists();
-                    let lower_name = name.to_lowercase();
-                    if is_virtual
-                        || lower_name.contains("docker")
-                        || lower_name.contains("veth")
-                        || lower_name.contains("br-")
-                        || lower_name.contains("virbr")
-                    {
-                        if lower_name.contains("tun")
-                            || lower_name.contains("tap")
-                            || lower_name.contains("wg")
-                        {
-                            itype = InterfaceType::Tunnel;
-                        } else {
-                            itype = InterfaceType::Virtual;
-                        }
-                    } else {
-                        itype = InterfaceType::Ethernet;
-                    }
-                }
-                _ => {
-                    let lower_name = name.to_lowercase();
-                    if lower_name.contains("tun")
-                        || lower_name.contains("tap")
-                        || lower_name.contains("wg")
-                    {
-                        itype = InterfaceType::Tunnel;
-                    } else if lower_name.contains("docker")
-                        || lower_name.contains("veth")
-                        || lower_name.contains("br-")
-                    {
-                        itype = InterfaceType::Virtual;
-                    } else {
-                        itype = InterfaceType::Other;
-                    }
-                }
-            }
-        }
-        interface.interface_type = itype;
+        // 3. 根据 sysfs 权威字段确定网卡类型。
+        let facts = read_linux_interface_facts(name);
+        interface.set_interface_type(linux_interface_type(name, &facts));
 
         // 4. 链路速度
         let speed_path = format!("/sys/class/net/{}/speed", name);
@@ -765,7 +790,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                 && let Ok(speed_val) = speed_str.trim().parse::<i64>()
                 && speed_val > 0
             {
-                interface.link_speed = Some((speed_val as u64) * 1_000_000);
+                interface.set_link_speed((speed_val as u64) * 1_000_000);
             }
         }
 
@@ -776,7 +801,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             read_stat_file(name, "rx_packets"),
             read_stat_file(name, "tx_packets"),
         ) {
-            interface.statistics = Some(InterfaceStats {
+            interface.set_statistics(InterfaceStats {
                 rx_bytes,
                 tx_bytes,
                 rx_packets,
@@ -785,7 +810,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
         }
 
         // 将路由挂在接口上，而不是复制到该接口的每个 IP 地址。
-        interface.routes = v4_routes
+        let routes = v4_routes
             .iter()
             .filter(|route| route.iface == *name)
             .map(LinuxRouteV4::to_route)
@@ -796,35 +821,16 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     .map(LinuxRouteV6::to_route),
             )
             .collect();
-        sort_routes(&mut interface.routes);
-
-        // 6. 按地址级证据聚合接口配置来源。
-        interface.allocation = aggregate_allocations(
-            interface
-                .ipv4_addresses
-                .iter()
-                .map(|address| address.allocation)
-                .chain(
-                    interface
-                        .ipv6_addresses
-                        .iter()
-                        .map(|address| address.allocation),
-                ),
-        );
+        interface.set_routes(routes);
     }
 
-    let mut interfaces: Vec<NetworkInterface> = interface_map.into_values().collect();
-    sort_interfaces(&mut interfaces);
-    let primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
-    let other = interfaces;
+    let interfaces: Vec<NetworkInterface> = interface_map
+        .into_values()
+        .map(InterfaceBuilder::build)
+        .collect();
 
     let dns = collect_linux_dns();
-
-    Ok(NetworkInterfaces {
-        primary,
-        other,
-        dns,
-    })
+    Ok(normalize_interfaces(interfaces, dns))
 }
 
 #[cfg(test)]
@@ -912,5 +918,61 @@ mod tests {
             server.interface.as_deref() == Some("eth0")
                 && server.source == DnsSource::NetworkManager
         }));
+    }
+
+    #[test]
+    fn classifies_wireless_from_sysfs_marker_before_arp_type() {
+        let facts = LinuxInterfaceFacts {
+            arp_type: Some(1),
+            wireless: true,
+            has_device: true,
+            has_driver: true,
+            ..LinuxInterfaceFacts::default()
+        };
+
+        assert_eq!(linux_interface_type("vendor0", &facts), InterfaceType::WiFi);
+    }
+
+    #[test]
+    fn does_not_guess_ethernet_or_virtual_from_missing_evidence() {
+        let ethernet_facts = LinuxInterfaceFacts {
+            arp_type: Some(1),
+            ..LinuxInterfaceFacts::default()
+        };
+        let virtual_facts = LinuxInterfaceFacts {
+            arp_type: Some(1),
+            ..LinuxInterfaceFacts::default()
+        };
+
+        assert_eq!(
+            linux_interface_type("vendor0", &ethernet_facts),
+            InterfaceType::Unknown
+        );
+        assert_eq!(
+            linux_interface_type("docker0", &virtual_facts),
+            InterfaceType::Unknown
+        );
+    }
+
+    #[test]
+    fn classifies_virtual_and_tunnel_from_sysfs_or_arp_fields() {
+        let bridge = LinuxInterfaceFacts {
+            arp_type: Some(1),
+            bridge_marker: true,
+            ..LinuxInterfaceFacts::default()
+        };
+        let tunnel = LinuxInterfaceFacts {
+            arp_type: Some(768),
+            ..LinuxInterfaceFacts::default()
+        };
+
+        assert_eq!(
+            linux_interface_type("bridge0", &bridge),
+            InterfaceType::Virtual
+        );
+        assert_eq!(
+            linux_interface_type("interface0", &tunnel),
+            InterfaceType::Tunnel
+        );
     }
 }

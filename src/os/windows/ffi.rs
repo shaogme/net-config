@@ -6,9 +6,9 @@ use std::ptr;
 use std::slice;
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetAdaptersAddresses, GetBestInterface, GetIfEntry2, GetIpForwardTable2,
-    IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DNS_SERVER_ADDRESS_XP, IP_ADAPTER_UNICAST_ADDRESS_LH,
-    MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    FreeMibTable, GetAdaptersAddresses, GetIfEntry2, GetIpForwardTable2, IP_ADAPTER_ADDRESSES_LH,
+    IP_ADAPTER_DNS_SERVER_ADDRESS_XP, IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IF_ROW2,
+    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET, SOCKET_ADDRESS,
@@ -46,17 +46,21 @@ pub(super) struct AdapterData {
     pub(super) dns_servers: Vec<ParsedSocketAddress>,
     pub(super) oper_status: i32,
     pub(super) interface_type: u32,
+    pub(super) tunnel_type: i32,
     pub(super) transmit_link_speed: u64,
     pub(super) receive_link_speed: u64,
 }
 
-pub(super) fn get_best_interface() -> Option<u32> {
-    let mut best_index = 0u32;
-    let result = unsafe { GetBestInterface(0x0808_0808, &mut best_index) };
-    (result == ERROR_SUCCESS).then_some(best_index)
+#[derive(Clone, Copy)]
+pub(super) struct InterfaceDetails {
+    pub(super) statistics: InterfaceStats,
+    pub(super) interface_type: u32,
+    pub(super) tunnel_type: i32,
+    pub(super) media_type: i32,
+    pub(super) physical_medium_type: i32,
 }
 
-pub(super) fn get_interface_stats(interface_index: u32) -> Option<InterfaceStats> {
+pub(super) fn get_interface_details(interface_index: u32) -> Option<InterfaceDetails> {
     let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
     row.InterfaceIndex = interface_index;
     let result = unsafe { GetIfEntry2(&mut row) };
@@ -64,11 +68,17 @@ pub(super) fn get_interface_stats(interface_index: u32) -> Option<InterfaceStats
         return None;
     }
 
-    Some(InterfaceStats {
-        rx_bytes: row.InOctets,
-        tx_bytes: row.OutOctets,
-        rx_packets: row.InUcastPkts.saturating_add(row.InNUcastPkts),
-        tx_packets: row.OutUcastPkts.saturating_add(row.OutNUcastPkts),
+    Some(InterfaceDetails {
+        statistics: InterfaceStats {
+            rx_bytes: row.InOctets,
+            tx_bytes: row.OutOctets,
+            rx_packets: row.InUcastPkts.saturating_add(row.InNUcastPkts),
+            tx_packets: row.OutUcastPkts.saturating_add(row.OutNUcastPkts),
+        },
+        interface_type: row.Type,
+        tunnel_type: row.TunnelType,
+        media_type: row.MediaType,
+        physical_medium_type: row.PhysicalMediumType,
     })
 }
 
@@ -448,6 +458,7 @@ impl AdapterBuffer {
                 dns_servers,
                 oper_status: adapter.OperStatus,
                 interface_type: adapter.IfType,
+                tunnel_type: adapter.TunnelType,
                 transmit_link_speed: adapter.TransmitLinkSpeed,
                 receive_link_speed: adapter.ReceiveLinkSpeed,
             },

@@ -1,5 +1,6 @@
 use crate::shared::{InterfaceStats, NetworkError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, c_char, c_void};
 use std::mem::{offset_of, size_of};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ptr;
@@ -9,6 +10,101 @@ const LINK_LAYER_ADDRESS_LENGTH: usize = 6;
 const LINK_LAYER_DATA_LENGTH: usize = 12;
 const MAX_INTERFACE_NAME_BYTES: usize = 256;
 const MAX_IFADDR_RECORDS: usize = 100_000;
+const MAX_SYSTEM_CONFIGURATION_INTERFACES: isize = 4096;
+const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+type CfArrayRef = *const c_void;
+type CfIndex = isize;
+type CfStringRef = *const c_void;
+type ScNetworkInterfaceRef = *const c_void;
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFArrayGetCount(array: CfArrayRef) -> CfIndex;
+    fn CFArrayGetValueAtIndex(array: CfArrayRef, index: CfIndex) -> *const c_void;
+    fn CFRelease(value: *const c_void);
+    fn CFStringGetCString(
+        value: CfStringRef,
+        buffer: *mut c_char,
+        buffer_size: CfIndex,
+        encoding: u32,
+    ) -> u8;
+}
+
+#[link(name = "SystemConfiguration", kind = "framework")]
+unsafe extern "C" {
+    fn SCNetworkInterfaceCopyAll() -> CfArrayRef;
+    fn SCNetworkInterfaceGetBSDName(interface: ScNetworkInterfaceRef) -> CfStringRef;
+    fn SCNetworkInterfaceGetInterfaceType(interface: ScNetworkInterfaceRef) -> CfStringRef;
+}
+
+struct CfArrayGuard(CfArrayRef);
+
+impl Drop for CfArrayGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+}
+
+fn cf_string_to_string(value: CfStringRef) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+
+    let mut buffer = [0u8; 128];
+    let copied = unsafe {
+        CFStringGetCString(
+            value,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as CfIndex,
+            CF_STRING_ENCODING_UTF8,
+        )
+    };
+    if copied == 0 {
+        return None;
+    }
+    CStr::from_bytes_until_nul(&buffer)
+        .ok()
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+/// 读取 SystemConfiguration 提供的稳定 BSD 名称和接口类型标识。
+pub(super) fn get_interface_types() -> Result<HashMap<String, String>, NetworkError> {
+    let array = unsafe { SCNetworkInterfaceCopyAll() };
+    if array.is_null() {
+        return Err(NetworkError::unsupported(
+            "macOS",
+            "SystemConfiguration interface types",
+        ));
+    }
+    let _guard = CfArrayGuard(array);
+    let count = unsafe { CFArrayGetCount(array) };
+    if !(0..=MAX_SYSTEM_CONFIGURATION_INTERFACES).contains(&count) {
+        return Err(NetworkError::invariant(format!(
+            "SystemConfiguration returned {} interfaces",
+            count
+        )));
+    }
+
+    let mut types = HashMap::new();
+    for index in 0..count {
+        let interface = unsafe { CFArrayGetValueAtIndex(array, index) };
+        if interface.is_null() {
+            continue;
+        }
+        let name = unsafe { SCNetworkInterfaceGetBSDName(interface) };
+        let interface_type = unsafe { SCNetworkInterfaceGetInterfaceType(interface) };
+        if let (Some(name), Some(interface_type)) = (
+            cf_string_to_string(name),
+            cf_string_to_string(interface_type),
+        ) {
+            types.insert(name, interface_type);
+        }
+    }
+    Ok(types)
+}
 
 pub(super) enum MacosAddress {
     Ipv4(Ipv4Addr),

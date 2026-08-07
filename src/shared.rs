@@ -340,6 +340,138 @@ pub struct NetworkInterface {
     pub statistics: Option<InterfaceStats>,
 }
 
+/// 用于将平台原始数据合并为统一接口模型的构造器。
+#[derive(Debug)]
+pub struct InterfaceBuilder {
+    interface: NetworkInterface,
+}
+
+impl InterfaceBuilder {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        status: InterfaceStatus,
+    ) -> Self {
+        Self {
+            interface: NetworkInterface {
+                name: name.into(),
+                description: description.into(),
+                mac_address: None,
+                ipv4_addresses: Vec::new(),
+                ipv6_addresses: Vec::new(),
+                routes: Vec::new(),
+                status,
+                interface_type: InterfaceType::Unknown,
+                allocation: IpAllocation::Unknown,
+                link_speed: None,
+                statistics: None,
+            },
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn interface_type(&self) -> InterfaceType {
+        self.interface.interface_type
+    }
+
+    pub fn set_interface_type(&mut self, interface_type: InterfaceType) {
+        self.interface.interface_type = interface_type;
+    }
+
+    #[allow(dead_code)]
+    pub fn set_status(&mut self, status: InterfaceStatus) {
+        self.interface.status = status;
+    }
+
+    pub fn add_ipv4_address(&mut self, address: Ipv4Info) {
+        self.interface.ipv4_addresses.push(address);
+    }
+
+    pub fn add_ipv6_address(&mut self, address: Ipv6Info) {
+        self.interface.ipv6_addresses.push(address);
+    }
+
+    #[allow(dead_code)]
+    pub fn ipv4_addresses(&self) -> &[Ipv4Info] {
+        &self.interface.ipv4_addresses
+    }
+
+    #[allow(dead_code)]
+    pub fn ipv4_addresses_mut(&mut self) -> &mut [Ipv4Info] {
+        &mut self.interface.ipv4_addresses
+    }
+
+    #[allow(dead_code)]
+    pub fn ipv6_addresses(&self) -> &[Ipv6Info] {
+        &self.interface.ipv6_addresses
+    }
+
+    #[allow(dead_code)]
+    pub fn ipv6_addresses_mut(&mut self) -> &mut [Ipv6Info] {
+        &mut self.interface.ipv6_addresses
+    }
+
+    #[allow(dead_code)]
+    pub fn has_addresses(&self) -> bool {
+        !self.interface.ipv4_addresses.is_empty() || !self.interface.ipv6_addresses.is_empty()
+    }
+
+    pub fn set_mac_address(&mut self, mac_address: String) {
+        self.interface.mac_address = Some(mac_address);
+    }
+
+    pub fn set_link_speed(&mut self, link_speed: u64) {
+        self.interface.link_speed = Some(link_speed);
+    }
+
+    pub fn set_statistics(&mut self, statistics: InterfaceStats) {
+        self.interface.statistics = Some(statistics);
+    }
+
+    pub fn set_routes(&mut self, routes: Vec<Route>) {
+        self.interface.routes = routes;
+    }
+
+    pub fn build(mut self) -> NetworkInterface {
+        normalize_interface(&mut self.interface);
+        self.interface
+    }
+}
+
+fn normalize_interface(interface: &mut NetworkInterface) {
+    sort_routes(&mut interface.routes);
+    interface.allocation = aggregate_allocations(
+        interface
+            .ipv4_addresses
+            .iter()
+            .map(|address| address.allocation)
+            .chain(
+                interface
+                    .ipv6_addresses
+                    .iter()
+                    .map(|address| address.allocation),
+            ),
+    );
+}
+
+/// 将平台构造的接口统一排序，并按共享规则选择主接口。
+pub fn normalize_interfaces(
+    mut interfaces: Vec<NetworkInterface>,
+    dns: DnsConfiguration,
+) -> NetworkInterfaces {
+    for interface in &mut interfaces {
+        normalize_interface(interface);
+    }
+    sort_interfaces(&mut interfaces);
+    let primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
+
+    NetworkInterfaces {
+        primary,
+        other: interfaces,
+        dns,
+    }
+}
+
 /// IPv4 地址与相关路由信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ipv4Info {
@@ -744,6 +876,29 @@ mod tests {
             IpAllocation::Mixed
         );
         assert_eq!(aggregate_allocations([]), IpAllocation::Unknown);
+    }
+
+    #[test]
+    fn interface_builder_aggregates_addresses_and_sorts_routes() {
+        let mut builder = InterfaceBuilder::new("eth0", "Ethernet", InterfaceStatus::Up);
+        builder.add_ipv4_address(Ipv4Info {
+            address: Ipv4Addr::new(192, 0, 2, 10),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            prefix_len: 24,
+            allocation: IpAllocation::Dhcpv4,
+        });
+        builder.add_ipv6_address(Ipv6Info {
+            address: Ipv6Addr::LOCALHOST,
+            prefix_len: 128,
+            allocation: IpAllocation::Manual,
+        });
+        builder.set_routes(vec![default_route("eth0", Some(100))]);
+
+        let interface = builder.build();
+
+        assert_eq!(interface.allocation, IpAllocation::Mixed);
+        assert_eq!(interface.routes.len(), 1);
+        assert!(interface.routes[0].is_default);
     }
 
     #[test]

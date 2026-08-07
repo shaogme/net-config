@@ -3,9 +3,20 @@ mod ffi;
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::shared::{
-    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceStatus, InterfaceType,
-    IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
-    aggregate_allocations, select_primary_interface, sort_interfaces, sort_routes,
+    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceBuilder, InterfaceStatus,
+    InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterfaces, Route,
+    normalize_interfaces,
+};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    IF_TYPE_ETHERNET_CSMACD, IF_TYPE_FAST, IF_TYPE_FASTETHER, IF_TYPE_FASTETHER_FX,
+    IF_TYPE_GIGABITETHERNET, IF_TYPE_IEEE8023AD_LAG, IF_TYPE_IEEE80211, IF_TYPE_L2_VLAN,
+    IF_TYPE_L3_IPVLAN, IF_TYPE_L3_IPXVLAN, IF_TYPE_OTHER, IF_TYPE_PPP, IF_TYPE_PROP_VIRTUAL,
+    IF_TYPE_SLIP, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, IF_TYPE_VIRTUALIPADDRESS,
+};
+use windows_sys::Win32::NetworkManagement::Ndis::{
+    NdisMedium802_3, NdisMediumLoopback, NdisMediumNative802_11, NdisMediumTunnel,
+    NdisMediumWirelessWan, NdisPhysicalMedium802_3, NdisPhysicalMediumNative802_11,
+    NdisPhysicalMediumWirelessLan, NdisPhysicalMediumWirelessWan, TUNNEL_TYPE_NONE,
 };
 
 struct WindowsRoute {
@@ -121,20 +132,75 @@ fn windows_ip_allocation(
     }
 }
 
-pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
-    // 1. 获取主网卡接口索引 (GetBestInterface)
-    // 传入 8.8.8.8 的大端表示 (0x08080808) 探测最优网络接口
-    let best_index = ffi::get_best_interface();
+fn windows_interface_type(
+    if_type: u32,
+    tunnel_type: i32,
+    media_type: Option<i32>,
+    physical_medium_type: Option<i32>,
+) -> InterfaceType {
+    if if_type == IF_TYPE_SOFTWARE_LOOPBACK || media_type == Some(NdisMediumLoopback) {
+        return InterfaceType::Loopback;
+    }
+    if if_type == IF_TYPE_TUNNEL
+        || if_type == IF_TYPE_PPP
+        || if_type == IF_TYPE_SLIP
+        || tunnel_type != TUNNEL_TYPE_NONE
+        || media_type == Some(NdisMediumTunnel)
+    {
+        return InterfaceType::Tunnel;
+    }
+    if matches!(
+        if_type,
+        IF_TYPE_PROP_VIRTUAL
+            | IF_TYPE_VIRTUALIPADDRESS
+            | IF_TYPE_L2_VLAN
+            | IF_TYPE_L3_IPVLAN
+            | IF_TYPE_L3_IPXVLAN
+    ) {
+        return InterfaceType::Virtual;
+    }
+    if if_type == IF_TYPE_IEEE80211
+        || media_type == Some(NdisMediumNative802_11)
+        || physical_medium_type.is_some_and(|value| {
+            value == NdisPhysicalMediumNative802_11 || value == NdisPhysicalMediumWirelessLan
+        })
+    {
+        return InterfaceType::WiFi;
+    }
+    if media_type == Some(NdisMediumWirelessWan)
+        || physical_medium_type == Some(NdisPhysicalMediumWirelessWan)
+    {
+        return InterfaceType::Other;
+    }
+    if matches!(
+        if_type,
+        IF_TYPE_ETHERNET_CSMACD
+            | IF_TYPE_FAST
+            | IF_TYPE_FASTETHER
+            | IF_TYPE_FASTETHER_FX
+            | IF_TYPE_GIGABITETHERNET
+            | IF_TYPE_IEEE8023AD_LAG
+    ) || media_type == Some(NdisMedium802_3)
+        || physical_medium_type == Some(NdisPhysicalMedium802_3)
+    {
+        return InterfaceType::Ethernet;
+    }
+    if if_type == IF_TYPE_OTHER {
+        return InterfaceType::Other;
+    }
 
-    // 2. 获取完整路由表。适配器上的 gateway 列表不包含目的前缀和 metric，
+    InterfaceType::Unknown
+}
+
+pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
+    // 1. 获取完整路由表。适配器上的 gateway 列表不包含目的前缀和 metric，
     // 不能用于建立可靠的地址到网关关系。
     let routes = get_windows_routes()?;
 
-    // 3. 由 FFI 适配层负责缓冲区扩容、边界和链表解析。
+    // 2. 由 FFI 适配层负责缓冲区扩容、边界和链表解析。
     let adapters = ffi::get_adapters()?;
 
-    let mut primary: Option<NetworkInterface> = None;
-    let mut other: Vec<NetworkInterface> = Vec::new();
+    let mut interfaces = Vec::new();
     let mut dns_servers = Vec::new();
 
     for adapter in adapters {
@@ -152,13 +218,9 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             None
         };
 
-        // 判定是否为主网卡
-        let is_primary = best_index.is_some_and(|best_index| {
-            adapter.interface_index == best_index || adapter.ipv6_interface_index == best_index
-        });
-
         let interface_index = adapter.interface_index;
-        let mut interface_routes = routes
+        let details = ffi::get_interface_details(interface_index);
+        let interface_routes = routes
             .iter()
             .filter(|route| {
                 (route.family == AddressFamily::Ipv4 && route.interface_index == interface_index)
@@ -168,12 +230,26 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             })
             .map(|route| route.clone_for_interface(&name))
             .collect::<Vec<Route>>();
-        sort_routes(&mut interface_routes);
-
-        let mut ipv4_addresses = Vec::new();
-        let mut ipv6_addresses = Vec::new();
+        let interface_type = windows_interface_type(
+            details.map_or(adapter.interface_type, |value| value.interface_type),
+            details.map_or(adapter.tunnel_type, |value| value.tunnel_type),
+            details.map(|value| value.media_type),
+            details.map(|value| value.physical_medium_type),
+        );
 
         // 3. 提取已由 FFI 适配层验证过的单播 IP 地址列表。
+        let status = match adapter.oper_status {
+            1 => InterfaceStatus::Up,
+            2 => InterfaceStatus::Down,
+            3 => InterfaceStatus::Testing,
+            _ => InterfaceStatus::Unknown,
+        };
+        let mut builder = InterfaceBuilder::new(name.clone(), description, status);
+        builder.set_interface_type(interface_type);
+        if let Some(mac_address) = mac_address {
+            builder.set_mac_address(mac_address);
+        }
+
         for unicast in adapter.unicast_addresses {
             let Some(address) = unicast.address else {
                 continue;
@@ -188,7 +264,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                 let prefix_len = unicast.prefix_len;
                 let netmask = prefix_to_ipv4_mask(prefix_len);
 
-                ipv4_addresses.push(Ipv4Info {
+                builder.add_ipv4_address(Ipv4Info {
                     address: ip,
                     netmask,
                     prefix_len,
@@ -196,7 +272,7 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                 });
             } else if let IpAddr::V6(ip) = address.address {
                 let prefix_len = unicast.prefix_len;
-                ipv6_addresses.push(Ipv6Info {
+                builder.add_ipv6_address(Ipv6Info {
                     address: ip,
                     prefix_len,
                     allocation: alloc,
@@ -204,52 +280,18 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             }
         }
 
-        // 4. 确定接口状态
-        let status = match adapter.oper_status {
-            1 => InterfaceStatus::Up,
-            2 => InterfaceStatus::Down,
-            3 => InterfaceStatus::Testing,
-            _ => InterfaceStatus::Unknown,
-        };
-
-        // 确定接口类型
-        let lower_desc = description.to_lowercase();
-        let lower_name = name.to_lowercase();
-        let is_virtual = lower_desc.contains("virtual")
-            || lower_desc.contains("vpn")
-            || lower_desc.contains("wsl")
-            || lower_desc.contains("docker")
-            || lower_desc.contains("tap")
-            || lower_desc.contains("hyper-v")
-            || lower_desc.contains("loopback")
-            || lower_name.contains("loopback")
-            || lower_desc.contains("zerotier")
-            || lower_desc.contains("wireguard");
-
-        let interface_type = match adapter.interface_type {
-            24 => InterfaceType::Loopback,
-            71 => InterfaceType::WiFi,
-            131 => InterfaceType::Tunnel,
-            _ => {
-                if is_virtual {
-                    InterfaceType::Virtual
-                } else if adapter.interface_type == 6 {
-                    InterfaceType::Ethernet
-                } else {
-                    InterfaceType::Other
-                }
-            }
-        };
-
-        // 确定链路速度
+        // 4. 确定链路速度
         let raw_speed = adapter.transmit_link_speed.max(adapter.receive_link_speed);
         let link_speed = if raw_speed > 0 && raw_speed != u64::MAX {
             Some(raw_speed)
         } else {
             None
         };
+        if let Some(link_speed) = link_speed {
+            builder.set_link_speed(link_speed);
+        }
 
-        // 提取已由 FFI 适配层验证过的 DNS 服务器地址。
+        // 5. 提取已由 FFI 适配层验证过的 DNS 服务器地址。
         for dns_addr in adapter.dns_servers {
             if dns_addr.family == AddressFamily::Ipv4 {
                 if let IpAddr::V4(address) = dns_addr.address {
@@ -268,50 +310,17 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
             }
         }
 
-        // 提取流量统计数据 (GetIfEntry2)
-        let statistics = ffi::get_interface_stats(interface_index);
-
-        let allocation = aggregate_allocations(
-            ipv4_addresses
-                .iter()
-                .map(|address| address.allocation)
-                .chain(ipv6_addresses.iter().map(|address| address.allocation)),
-        );
-
-        let iface = NetworkInterface {
-            name,
-            description,
-            mac_address,
-            ipv4_addresses,
-            ipv6_addresses,
-            routes: interface_routes,
-            status,
-            interface_type,
-            allocation,
-            link_speed,
-            statistics,
-        };
-
-        if is_primary && primary.is_none() {
-            primary = Some(iface);
-        } else {
-            other.push(iface);
+        // 6. 提取由 GetIfEntry2 返回的统计数据。
+        if let Some(details) = details {
+            builder.set_statistics(details.statistics);
         }
-    }
 
-    sort_interfaces(&mut other);
-    if primary.is_none()
-        && let Some(index) = select_primary_interface(&other)
-    {
-        primary = Some(other.remove(index));
+        builder.set_routes(interface_routes);
+        interfaces.push(builder.build());
     }
 
     let dns = DnsConfiguration::from_servers(dns_servers);
-    Ok(NetworkInterfaces {
-        primary,
-        other,
-        dns,
-    })
+    Ok(normalize_interfaces(interfaces, dns))
 }
 
 #[cfg(test)]
@@ -350,6 +359,37 @@ mod tests {
         assert_eq!(
             windows_ip_allocation(AddressFamily::Ipv4, 5, 0),
             IpAllocation::Unknown
+        );
+    }
+
+    #[test]
+    fn classifies_windows_interfaces_from_iftype_tunnel_and_media() {
+        use windows_sys::Win32::NetworkManagement::Ndis::TUNNEL_TYPE_DIRECT;
+
+        assert_eq!(
+            windows_interface_type(IF_TYPE_IEEE80211, TUNNEL_TYPE_NONE, None, None),
+            InterfaceType::WiFi
+        );
+        assert_eq!(
+            windows_interface_type(IF_TYPE_OTHER, TUNNEL_TYPE_DIRECT, None, None),
+            InterfaceType::Tunnel
+        );
+        assert_eq!(
+            windows_interface_type(IF_TYPE_PROP_VIRTUAL, TUNNEL_TYPE_NONE, None, None),
+            InterfaceType::Virtual
+        );
+        assert_eq!(
+            windows_interface_type(
+                IF_TYPE_OTHER,
+                TUNNEL_TYPE_NONE,
+                None,
+                Some(NdisPhysicalMediumWirelessLan),
+            ),
+            InterfaceType::WiFi
+        );
+        assert_eq!(
+            windows_interface_type(999, TUNNEL_TYPE_NONE, None, None),
+            InterfaceType::Unknown
         );
     }
 }

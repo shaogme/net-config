@@ -1,10 +1,9 @@
 mod ffi;
 
 use crate::shared::{
-    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceStatus, InterfaceType,
-    IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface, NetworkInterfaces, Route,
-    aggregate_allocations, parse_resolv_conf, select_primary_interface, sort_interfaces,
-    sort_routes,
+    AddressFamily, DnsConfiguration, DnsServer, DnsSource, InterfaceBuilder, InterfaceStatus,
+    InterfaceType, IpAllocation, Ipv4Info, Ipv6Info, NetworkError, NetworkInterface,
+    NetworkInterfaces, Route, normalize_interfaces, parse_resolv_conf,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -404,48 +403,14 @@ fn get_macos_default_route_v6() -> Result<Option<Route>, NetworkError> {
     }))
 }
 
-/// 解析物理端口设备映射 (执行 networksetup -listallhardwareports)
-fn get_macos_interface_types()
--> Result<std::collections::HashMap<String, InterfaceType>, NetworkError> {
-    let mut types = std::collections::HashMap::new();
-    let args = ["-listallhardwareports"];
-    let output = std::process::Command::new("networksetup")
-        .args(["-listallhardwareports"])
-        .output()
-        .map_err(|source| NetworkError::command_spawn("networksetup", &args, source))?;
-    if !output.status.success() {
-        return Err(NetworkError::command_failed(
-            "networksetup",
-            &args,
-            output.status,
-            &output.stderr,
-        ));
+fn macos_interface_type(identifier: &str) -> InterfaceType {
+    match identifier {
+        "Ethernet" => InterfaceType::Ethernet,
+        "IEEE80211" => InterfaceType::WiFi,
+        "PPP" | "Modem" => InterfaceType::Tunnel,
+        "Bluetooth" | "FireWire" | "IRDA" | "Other" | "WWAN" => InterfaceType::Other,
+        _ => InterfaceType::Unknown,
     }
-
-    let s = String::from_utf8_lossy(&output.stdout);
-    let mut current_port = String::new();
-    for line in s.lines() {
-        let line = line.trim();
-        if line.starts_with("Hardware Port:") {
-            current_port = line.trim_start_matches("Hardware Port:").trim().to_string();
-        } else if line.starts_with("Device:") {
-            let device = line.trim_start_matches("Device:").trim().to_string();
-            if !device.is_empty() && !current_port.is_empty() {
-                let itype = if current_port.contains("Wi-Fi") {
-                    InterfaceType::WiFi
-                } else if current_port.contains("Ethernet") || current_port.contains("Thunderbolt")
-                {
-                    InterfaceType::Ethernet
-                } else if current_port.contains("Bridge") {
-                    InterfaceType::Virtual
-                } else {
-                    InterfaceType::Other
-                };
-                types.insert(device, itype);
-            }
-        }
-    }
-    Ok(types)
 }
 
 fn parse_scutil_dns(output: &str) -> Vec<DnsServer> {
@@ -502,24 +467,16 @@ fn collect_macos_dns() -> DnsConfiguration {
     }
 }
 
-fn empty_macos_interface(name: &str, is_up: bool) -> NetworkInterface {
-    NetworkInterface {
-        name: name.to_string(),
-        description: name.to_string(),
-        mac_address: None,
-        ipv4_addresses: Vec::new(),
-        ipv6_addresses: Vec::new(),
-        routes: Vec::new(),
-        status: if is_up {
+fn empty_macos_interface(name: &str, is_up: bool) -> InterfaceBuilder {
+    InterfaceBuilder::new(
+        name,
+        name,
+        if is_up {
             InterfaceStatus::Up
         } else {
             InterfaceStatus::Down
         },
-        interface_type: InterfaceType::Unknown,
-        allocation: IpAllocation::Unknown,
-        link_speed: None,
-        statistics: None,
-    }
+    )
 }
 
 /// macOS 下获取所有网卡信息的统一实现
@@ -539,24 +496,32 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
         v6_routes.push(route);
     }
     routes.extend(v6_routes);
-    sort_routes(&mut routes);
 
-    // 2. 加载硬件端口物理映射
-    let hardware_types = get_macos_interface_types()?;
+    // 2. 读取 SystemConfiguration 的稳定接口类型标识。
+    let hardware_types = ffi::get_interface_types()?;
 
     // 3. 由 FFI 适配层验证 getifaddrs 链表和 sockaddr 布局。
     let records = ffi::get_ifaddrs_records()?;
-    let mut interface_map: HashMap<String, NetworkInterface> = HashMap::new();
+    let mut interface_map: HashMap<String, InterfaceBuilder> = HashMap::new();
 
     for record in records {
         let name = record.name;
         let is_up = (record.flags & libc::IFF_UP as u32) != 0;
-        let address = record.address;
+        let is_loopback = (record.flags & libc::IFF_LOOPBACK as u32) != 0;
+        let Some(address) = record.address else {
+            continue;
+        };
         let netmask = record.netmask;
         let link_data = record.link_data;
+        let entry = interface_map
+            .entry(name.clone())
+            .or_insert_with(|| empty_macos_interface(&name, is_up));
+        if is_loopback {
+            entry.set_interface_type(InterfaceType::Loopback);
+        }
 
         match address {
-            Some(ffi::MacosAddress::Ipv4(ip)) => {
+            ffi::MacosAddress::Ipv4(ip) => {
                 let (netmask, prefix_len) = match netmask {
                     Some(ffi::MacosAddress::Ipv4(mask)) => {
                         let bytes = mask.octets();
@@ -564,17 +529,14 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     }
                     _ => (Ipv4Addr::new(255, 255, 255, 0), 24),
                 };
-                let entry = interface_map
-                    .entry(name.clone())
-                    .or_insert_with(|| empty_macos_interface(&name, is_up));
-                entry.ipv4_addresses.push(Ipv4Info {
+                entry.add_ipv4_address(Ipv4Info {
                     address: ip,
                     netmask,
                     prefix_len,
                     allocation: IpAllocation::Unknown,
                 });
             }
-            Some(ffi::MacosAddress::Ipv6(ip)) => {
+            ffi::MacosAddress::Ipv6(ip) => {
                 let prefix_len = match netmask {
                     Some(ffi::MacosAddress::Ipv6(mask)) => {
                         mask.octets()
@@ -584,19 +546,13 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                     }
                     _ => 64,
                 };
-                let entry = interface_map
-                    .entry(name.clone())
-                    .or_insert_with(|| empty_macos_interface(&name, is_up));
-                entry.ipv6_addresses.push(Ipv6Info {
+                entry.add_ipv6_address(Ipv6Info {
                     address: ip,
                     prefix_len,
                     allocation: IpAllocation::Unknown,
                 });
             }
-            Some(ffi::MacosAddress::Link) => {
-                let entry = interface_map
-                    .entry(name.clone())
-                    .or_insert_with(|| empty_macos_interface(&name, is_up));
+            ffi::MacosAddress::Link => {
                 if let Some(link_data) = link_data {
                     if let Some(mac_bytes) = link_data.mac_address {
                         let formatted = format!(
@@ -609,97 +565,61 @@ pub fn get_network_interfaces() -> Result<NetworkInterfaces, NetworkError> {
                             mac_bytes[5]
                         );
                         if formatted != "00:00:00:00:00:00" {
-                            entry.mac_address = Some(formatted);
+                            entry.set_mac_address(formatted);
                         }
                     }
-                    if link_data.statistics.is_some() {
-                        entry.statistics = link_data.statistics;
+                    if let Some(statistics) = link_data.statistics {
+                        entry.set_statistics(statistics);
                     }
-                    if link_data.link_speed.is_some() {
-                        entry.link_speed = link_data.link_speed;
+                    if let Some(link_speed) = link_data.link_speed {
+                        entry.set_link_speed(link_speed);
                     }
                 }
             }
-            None => {}
         }
     }
 
     // 地址遍历完成后按接口生成一次分配证据；后处理只读取这份缓存。
     let allocation_evidence: HashMap<String, MacosAllocationEvidence> = interface_map
         .iter()
-        .filter(|(name, interface)| {
-            !name.starts_with("lo")
-                && (!interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty())
-        })
+        .filter(|(_, interface)| interface.has_addresses())
         .map(|(name, _)| (name.clone(), collect_macos_allocation_evidence(name)))
         .collect();
 
     // 4. 后处理：精细化接口类型分类与映射
     for (name, interface) in &mut interface_map {
         let evidence = allocation_evidence.get(name);
-        for address in &mut interface.ipv4_addresses {
+        for address in interface.ipv4_addresses_mut() {
             address.allocation = macos_ipv4_allocation(name, address.address, evidence);
         }
-        for address in &mut interface.ipv6_addresses {
+        for address in interface.ipv6_addresses_mut() {
             address.allocation = macos_ipv6_allocation(name, address.address, evidence);
         }
 
-        let itype;
-        if name.starts_with("lo") {
-            itype = InterfaceType::Loopback;
-        } else if let Some(t) = hardware_types.get(name) {
-            itype = *t;
-        } else {
-            let lower_name = name.to_lowercase();
-            if lower_name.contains("utun")
-                || lower_name.contains("gif")
-                || lower_name.contains("stf")
-                || lower_name.contains("ppp")
-            {
-                itype = InterfaceType::Tunnel;
-            } else if lower_name.contains("bridge") {
-                itype = InterfaceType::Virtual;
-            } else if lower_name.contains("en") {
-                itype = InterfaceType::Ethernet;
-            } else {
-                itype = InterfaceType::Other;
-            }
+        if interface.interface_type() != InterfaceType::Loopback {
+            let interface_type = hardware_types
+                .get(name)
+                .map_or(InterfaceType::Unknown, |identifier| {
+                    macos_interface_type(identifier)
+                });
+            interface.set_interface_type(interface_type);
         }
-        interface.interface_type = itype;
 
-        interface.routes = routes
+        let interface_routes = routes
             .iter()
             .filter(|route| route.interface == *name)
             .cloned()
             .collect();
-        sort_routes(&mut interface.routes);
-
-        interface.allocation = aggregate_allocations(
-            interface
-                .ipv4_addresses
-                .iter()
-                .map(|address| address.allocation)
-                .chain(
-                    interface
-                        .ipv6_addresses
-                        .iter()
-                        .map(|address| address.allocation),
-                ),
-        );
+        interface.set_routes(interface_routes);
     }
 
-    let mut interfaces: Vec<NetworkInterface> = interface_map.into_values().collect();
-    sort_interfaces(&mut interfaces);
-    let primary = select_primary_interface(&interfaces).map(|index| interfaces.remove(index));
-    let other = interfaces;
+    let interfaces: Vec<NetworkInterface> = interface_map
+        .into_values()
+        .map(InterfaceBuilder::build)
+        .collect();
 
     let dns = collect_macos_dns();
-
-    Ok(NetworkInterfaces {
-        primary,
-        other,
-        dns,
-    })
+    Ok(normalize_interfaces(interfaces, dns))
 }
 
 #[cfg(test)]
@@ -822,6 +742,17 @@ mod tests {
                 Some(&evidence),
             ),
             IpAllocation::Other
+        );
+    }
+
+    #[test]
+    fn maps_system_configuration_interface_type_identifiers() {
+        assert_eq!(macos_interface_type("IEEE80211"), InterfaceType::WiFi);
+        assert_eq!(macos_interface_type("Ethernet"), InterfaceType::Ethernet);
+        assert_eq!(macos_interface_type("PPP"), InterfaceType::Tunnel);
+        assert_eq!(
+            macos_interface_type("localized bridge"),
+            InterfaceType::Unknown
         );
     }
 }
