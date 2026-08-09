@@ -28,7 +28,7 @@ NetConfig 是一个用 Rust 编写的轻量级、高性能、跨平台网络接�
 NetConfig 深度集成各操作系统的原生底层 API，以保障最高的效率与准确性：
 
 - Windows：调用 IP 助手 (IP Helper / IPHLPAPI) API。通过 GetBestInterface 传入模拟外部 IP 以确定当前主网卡索引；使用 GetAdaptersAddresses 提取单播 IP 的 PrefixOrigin/SuffixOrigin，分别表达 DHCP、手动、路由器通告和 SLAAC，适配器 DHCP 标志不再覆盖地址级未知结果；DNS 作为带适配器归属的系统级结果输出。
-- Linux：解析 /proc/net/route 和 /proc/net/ipv6_route 路由文件，保留目的前缀、下一跳、接口名和 Metric，并据此找出主网卡。使用 libc::getifaddrs 遍历 IP 地址和掩码列表，仅将租约中明确出现的地址标为 DHCP，IPv6 内核隐私/SLAAC 标志作为 SLAAC 证据，其他缺少证据的地址保留 Unknown。从 /sys/class/net/<interface>/ 目录下的虚拟文件中读取网卡状态、物理类型、链路速度、MAC 地址和流量统计。DNS 按 systemd-resolved、NetworkManager、resolv.conf 回退顺序采集，并保留来源和接口归属。
+- Linux：通过原生 rtnetlink 的 RTM_GETLINK、RTM_GETADDR 和 RTM_GETROUTE dump 获取接口、地址 flags/protocol、生命周期、路由和 Metric，并按 ifindex 关联数据。使用 NetworkManager、ifupdown、systemd-networkd/DHCP 租约及 DHCP 路由作为来源证据；`dynamic` 单独不会被误报为 DHCP，`kernel_ra`、SLAAC flags、`inet6 auto` 和链路本地地址分别按证据分类。链路速度和部分硬件信息从 `/sys/class/net/<interface>/` 补充，DNS 按 systemd-resolved、NetworkManager、resolv.conf 回退顺序采集，并保留来源和接口归属。
 - macOS：通过 netstat -rn 读取 IPv4/IPv6 完整路由表，并以 route get default 与 route get -inet6 default 作为回退，保留 link-local 网关作用域和接口归属。使用 networksetup -listallhardwareports 区分物理端口介质。按接口缓存 ipconfig 的 DHCP/DHCPv6 探测，并从 ifconfig 的 autoconf/temporary 标志识别 SLAAC；没有证据时返回 Unknown。通过 libc::getifaddrs 提取 IP 信息，从 AF_LINK 套接字结构中提取 MAC 地址、物理速度和网络吞吐。DNS 优先解析 scutil --dns，失败时记录 resolv.conf 回退来源。
 
 ## 安装与编译
