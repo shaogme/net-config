@@ -84,6 +84,7 @@ fn run() -> Result<(), AppError> {
     let mut show_all = false;
     let mut show_help = false;
     let mut json_output = false;
+    let mut show_version = false;
     let mut unknown_arg = None;
     let mut custom_lang = None;
 
@@ -93,6 +94,7 @@ fn run() -> Result<(), AppError> {
         match arg.as_str() {
             "-a" | "--all" => show_all = true,
             "-h" | "--help" => show_help = true,
+            "-v" | "--version" => show_version = true,
             "-j" | "--json" => json_output = true,
             "-l" | "--lang" => {
                 if let Some(val) = args_iter.peek() {
@@ -128,6 +130,11 @@ fn run() -> Result<(), AppError> {
         }
     }
 
+    if show_version {
+        print_version(&args[0])?;
+        return Ok(());
+    }
+
     if show_help {
         print_help(&args[0])?;
         return Ok(());
@@ -152,12 +159,35 @@ fn run() -> Result<(), AppError> {
     Ok(())
 }
 
-fn print_help(program_name: &str) -> Result<(), AppError> {
+fn get_program_name(program_name: &str) -> &str {
     let path = std::path::Path::new(program_name);
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(program_name);
+
+    #[cfg(windows)]
+    if let Some(stripped) = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+    {
+        return stripped;
+    }
+    name
+}
+
+fn print_version(program_name: &str) -> Result<(), AppError> {
+    let name = get_program_name(program_name);
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "{} {}", name, env!("CARGO_PKG_VERSION"))?;
+    output.flush()?;
+    Ok(())
+}
+
+fn print_help(program_name: &str) -> Result<(), AppError> {
+    let name = get_program_name(program_name);
 
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -168,6 +198,7 @@ fn print_help(program_name: &str) -> Result<(), AppError> {
     writeln!(output, "{}", t!(OptAll))?;
     writeln!(output, "{}", t!(OptJson))?;
     writeln!(output, "{}", t!(OptHelp))?;
+    writeln!(output, "{}", t!(OptVersion))?;
     writeln!(output, "{}", t!(OptLang))?;
     output.flush()?;
     Ok(())

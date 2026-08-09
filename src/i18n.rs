@@ -73,6 +73,7 @@ pub enum Text {
     OptAll,
     OptJson,
     OptHelp,
+    OptVersion,
     OptLang,
     IfaceName,
     IfaceDescription,
@@ -141,6 +142,7 @@ impl Text {
                 Text::OptAll => "  -a, --all      显示所有网卡接口信息（默认仅显示主/默认网卡）",
                 Text::OptJson => "  -j, --json     以 JSON 格式输出结果",
                 Text::OptHelp => "  -h, --help     显示帮助信息",
+                Text::OptVersion => "  -v, --version  显示版本信息",
                 Text::OptLang => "  -l, --lang     手动指定语言，支持 'zh' (中文) 或 'en' (英文)",
                 Text::IfaceName => "网卡名称",
                 Text::IfaceDescription => "友好描述",
@@ -205,6 +207,7 @@ impl Text {
                 }
                 Text::OptJson => "  -j, --json     Output results in JSON format",
                 Text::OptHelp => "  -h, --help     Show help information",
+                Text::OptVersion => "  -v, --version  Show version information",
                 Text::OptLang => {
                     "  -l, --lang     Specify language, 'zh' (Chinese) or 'en' (English)"
                 }

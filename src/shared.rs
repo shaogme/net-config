@@ -130,7 +130,7 @@ pub fn sort_interfaces(interfaces: &mut [NetworkInterface]) {
 }
 
 /// 将连续 IPv4 子网掩码转换为前缀长度。
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn ipv4_prefix_len(netmask: Ipv4Addr) -> Option<u8> {
     let value = u32::from_be_bytes(netmask.octets());
     let prefix_len = value.leading_ones() as u8;
@@ -143,7 +143,7 @@ pub(crate) fn ipv4_prefix_len(netmask: Ipv4Addr) -> Option<u8> {
 }
 
 /// 将连续 IPv6 子网掩码转换为前缀长度。
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn ipv6_prefix_len(netmask: Ipv6Addr) -> Option<u8> {
     let value = u128::from_be_bytes(netmask.octets());
     let prefix_len = value.leading_ones() as u8;
@@ -428,11 +428,6 @@ impl InterfaceBuilder {
         self.interface.interface_type = interface_type;
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn set_status(&mut self, status: InterfaceStatus) {
-        self.interface.status = status;
-    }
-
     pub fn add_ipv4_address(&mut self, address: Ipv4Info) {
         self.interface.ipv4_addresses.push(address);
     }
@@ -494,18 +489,34 @@ impl InterfaceBuilder {
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn normalize_interface(interface: &mut NetworkInterface) {
     sort_routes(&mut interface.routes);
-    interface.allocation = aggregate_allocations(
-        interface
-            .ipv4_addresses
+    // 链路本地和环回地址的 Other 不代表接口的业务配置来源。
+    let allocations = interface
+        .ipv4_addresses
+        .iter()
+        .map(|address| address.allocation)
+        .chain(
+            interface
+                .ipv6_addresses
+                .iter()
+                .map(|address| address.allocation),
+        )
+        .collect::<Vec<_>>();
+    let meaningful_allocations = allocations
+        .iter()
+        .copied()
+        .filter(|allocation| *allocation != IpAllocation::Other)
+        .collect::<Vec<_>>();
+    interface.allocation = if !allocations.is_empty()
+        && allocations
             .iter()
-            .map(|address| address.allocation)
-            .chain(
-                interface
-                    .ipv6_addresses
-                    .iter()
-                    .map(|address| address.allocation),
-            ),
-    );
+            .all(|allocation| *allocation == IpAllocation::Other)
+    {
+        IpAllocation::Other
+    } else if !meaningful_allocations.is_empty() {
+        aggregate_allocations(meaningful_allocations)
+    } else {
+        aggregate_allocations(allocations)
+    };
 }
 
 /// 将平台构造的接口统一排序，并按共享规则选择主接口。
@@ -1036,6 +1047,24 @@ mod tests {
             IpAllocation::Mixed
         );
         assert_eq!(aggregate_allocations([]), IpAllocation::Unknown);
+    }
+
+    #[test]
+    fn interface_allocation_ignores_link_local_other_addresses() {
+        let mut builder = InterfaceBuilder::new("enp0s3", "Ethernet", InterfaceStatus::Up);
+        builder.add_ipv4_address(Ipv4Info {
+            address: Ipv4Addr::new(192, 0, 2, 10),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            prefix_len: 24,
+            allocation: IpAllocation::Dhcpv4,
+        });
+        builder.add_ipv6_address(Ipv6Info {
+            address: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            prefix_len: 64,
+            allocation: IpAllocation::Other,
+        });
+
+        assert_eq!(builder.build().allocation, IpAllocation::Dhcpv4);
     }
 
     #[test]

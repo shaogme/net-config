@@ -21,6 +21,17 @@ fn help_writes_contract_to_stdout_only() {
 }
 
 #[test]
+fn version_writes_contract_to_stdout_only() {
+    let output = run_cli(&["--version"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success());
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+}
+
+#[test]
 fn unknown_argument_returns_failure_with_split_output() {
     let output = run_cli(&["--lang", "en", "--not-supported"]);
     let stdout = String::from_utf8_lossy(&output.stdout);

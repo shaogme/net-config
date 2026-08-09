@@ -28,7 +28,7 @@ Unlike standard tools, NetConfig intelligently identifies the primary network in
 NetConfig relies on native operating system APIs for maximum performance and accuracy:
 
 - Windows: Uses the IP Helper (IPHLPAPI) library. Resolves the primary interface via GetBestInterface using a mock target IP address. Extracts unicast PrefixOrigin/SuffixOrigin values with GetAdaptersAddresses to distinguish DHCP, Manual, Router Advertisement, and SLAAC without using the adapter DHCP flag as an address-level fallback; DNS is emitted as an interface-associated system result.
-- Linux: Parses /proc/net/route and /proc/net/ipv6_route to retain destination prefixes, next hops, interface names, and routing metrics. Queries system interfaces and IP details using libc::getifaddrs. Marks only addresses explicitly present in system DHCP leases as DHCP, uses IPv6 privacy/SLAAC flags as SLAAC evidence, and leaves unsupported inferences Unknown. Retrieves interface operational state, media type, link speed, MAC address, and traffic counters directly from /sys/class/net/<interface>/. Collects DNS from systemd-resolved, NetworkManager, and finally resolv.conf while preserving source and interface scope.
+- Linux: Uses native rtnetlink RTM_GETLINK, RTM_GETADDR, and RTM_GETROUTE dumps for interface data, address flags/protocols, lifetimes, routes, and metrics, joining records by ifindex. Combines NetworkManager, ifupdown, systemd-networkd/DHCP leases, and DHCP route protocol as allocation evidence; a standalone `dynamic` flag is not misreported as DHCP, while `kernel_ra`, SLAAC flags, `inet6 auto`, and link-local scope are classified from their specific evidence. Link speed and remaining hardware details are supplemented from `/sys/class/net/<interface>/.` Collects DNS from systemd-resolved, NetworkManager, and finally resolv.conf while preserving source and interface scope.
 - macOS: Reads complete IPv4 and IPv6 route tables with netstat -rn and uses route get default as a fallback, preserving link-local gateway scopes and interface associations. Uses networksetup -listallhardwareports to distinguish physical media. Caches per-interface ipconfig DHCP/DHCPv6 probes and reads ifconfig autoconf/temporary flags for SLAAC; unsupported inferences remain Unknown. Uses libc::getifaddrs to list IP bindings, and parses AF_LINK for MAC addresses and hardware metrics. Uses scutil --dns first and records resolv.conf as an explicit fallback source.
 
 ## Installation
@@ -87,6 +87,7 @@ Options:
   -a, --all      Show all network interfaces (default shows primary/default interface only)
   -j, --json     Output results in JSON format
   -h, --help     Show help information
+  -v, --version  Show version information
   -l, --lang     Specify language, 'zh' (Chinese) or 'en' (English)
 ```
 
