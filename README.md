@@ -87,6 +87,7 @@ Options:
   -a, --all      Show all network interfaces (default shows primary/default interface only)
   -j, --json     Output results in JSON format
   -h, --help     Show help information
+  -v, --version  Show version information
   -l, --lang     Specify language, 'zh' (Chinese) or 'en' (English)
 ```
 

@@ -87,6 +87,7 @@ cargo build --release
   -a, --all      显示所有网卡接口信息（默认仅显示主/默认网卡）
   -j, --json     以 JSON 格式输出结果
   -h, --help     显示帮助信息
+  -v, --version  显示版本信息
   -l, --lang     手动指定语言，支持 'zh' (中文) 或 'en' (英文)
 ```
 
